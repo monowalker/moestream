@@ -1,0 +1,15 @@
+#version 450
+// Read the whole buffer with a grid stride and fold it with XOR.
+// The result is always written out so the reads cannot be optimized away.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Src { uvec4 data[]; };
+layout(binding = 1)          buffer Dst { uvec4 outv[]; };
+layout(push_constant) uniform PC { uint n; };
+
+void main() {
+    uint gid    = gl_GlobalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * 256u;
+    uvec4 acc = uvec4(0u);
+    for (uint i = gid; i < n; i += stride) acc ^= data[i];
+    outv[gid] = acc;
+}

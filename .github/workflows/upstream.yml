@@ -1,0 +1,61 @@
+# =============================================================================
+# Does the patch still apply to the current llama.cpp?
+#
+#   MoEStream pins llama.cpp (Dockerfile: ARG LLAMA_COMMIT) because it patches
+#   internals that are not a public API. Pinning keeps builds reproducible and
+#   keeps docs/RESULTS.md honest -- every number there was measured against that
+#   one commit.
+#
+#   The cost of pinning is falling behind. This job pays it back: once a week it
+#   builds against llama.cpp master and reports. A failure here breaks nobody's
+#   build; it is a signal that moving the pin now needs work, and it arrives
+#   while the upstream change is still fresh rather than months later.
+#
+#   Run it by hand from the Actions tab whenever you want to know if it is safe
+#   to move up.
+# =============================================================================
+name: upstream
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'     # Mondays, 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  master:
+    name: build against llama.cpp master
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve current master
+        id: rev
+        run: |
+          SHA=$(git ls-remote https://github.com/ggml-org/llama.cpp.git HEAD | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "llama.cpp master is $SHA"
+          echo "pinned in Dockerfile: $(grep -oE '[0-9a-f]{40}' Dockerfile | head -1)"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Build with the patch applied to master
+        run: |
+          docker build -f Dockerfile \
+            --build-arg LLAMA_COMMIT=${{ steps.rev.outputs.sha }} \
+            -t moestream/server:upstream .
+
+      - name: What this result means
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "The patch still applies to llama.cpp ${{ steps.rev.outputs.sha }}."
+            echo "It compiles. It has NOT been measured -- speed and output"
+            echo "correctness need the real machine (docs/RESULTS.md §12)."
+          else
+            echo "The patch no longer applies to llama.cpp master."
+            echo "src/apply.py names the anchor that moved; update it there."
+            echo "Nothing is broken for users: the Dockerfile is still pinned."
+          fi

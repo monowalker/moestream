@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(moestream_spike_s2 C)
+set(CMAKE_C_STANDARD 11)
+add_executable(s2_iouring_bw main.c)
+find_library(URING_LIB uring REQUIRED)
+target_link_libraries(s2_iouring_bw PRIVATE ${URING_LIB})
+message(STATUS "liburing: ${URING_LIB}")

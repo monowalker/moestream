@@ -1,0 +1,11 @@
+# MoEStream persists learned tuning here. Both files are plain TSV.
+#
+#   tuning.tsv   <model file>  <frac>   <n_expert:bytes_per_slot>
+#   ubatch.tsv   <model file>  <frac>   <ubatch>  <prefill tok/s>
+#
+# ubatch rows carry the frac they were measured at because the two interact:
+# on Ornith-35B the best ubatch is 1024 at frac=0.25 but 2048 at frac=0.15.
+# When frac moves, the old rows stop matching and the candidates are re-measured.
+#
+# Delete a file to start the search over. The contents are machine- and
+# workload-specific, so they are not distributed.

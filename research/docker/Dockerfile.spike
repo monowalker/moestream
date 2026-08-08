@@ -1,0 +1,15 @@
+# Image for spikes: the dev image plus the spike sources, nothing else.
+# Bind mounts are avoided because the host path is not always resolvable
+# (for instance when launched from another container via docker.sock).
+ARG BASE=moestream-dev:local
+FROM ${BASE}
+
+ARG SPIKE=s0_slot_slab
+
+COPY spikes /work/spikes
+
+RUN cmake -S /work/spikes/${SPIKE} -B /work/build/${SPIKE} -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /work/build/${SPIKE} -j"$(nproc)"
+
+ENV SPIKE=${SPIKE}
+CMD ["/bin/sh", "-c", "/work/build/${SPIKE}/${SPIKE}"]

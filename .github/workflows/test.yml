@@ -1,0 +1,46 @@
+# =============================================================================
+# What can be checked without the hardware.
+#
+#   MoEStream needs an iGPU and 17-55 GB models to measure anything, and GitHub
+#   runners have neither. So this workflow deliberately checks only two things:
+#
+#     1. the logic that runs without hardware      (make test, ~30 s)
+#     2. that the patch still applies to llama.cpp (a full image build, ~25 min)
+#
+#   Speed and output correctness are NOT checked here and cannot be. They need
+#   the real machine -- see docs/RESULTS.md §12.
+# =============================================================================
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+jobs:
+  # ---- fast: every push -----------------------------------------------------
+  logic:
+    name: logic (no hardware)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make test
+        run: make test
+
+  # ---- slow: only where it earns its 25 minutes -----------------------------
+  #   The point of this job is not "does it compile" but "do the patch anchors
+  #   still exist in llama.cpp". src/apply.py asserts on every anchor, so this
+  #   fails loudly the moment upstream moves the code it depends on.
+  build:
+    name: product image (pinned llama.cpp)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push'      # pull requests and manual runs only
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        # The llama.cpp build needs more room than the runner has by default.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+      - name: docker build
+        run: docker build -f Dockerfile -t moestream/server:ci .

@@ -1,0 +1,53 @@
+# MoEStream — llama-server running MoE models with expert weights streamed from SSD
+#
+#   start: docker compose up -d     stop:   docker compose down
+#   logs:  docker compose logs -f   config: .env (cp .env.example .env)
+#
+#   Web UI: http://localhost:${MS_PORT}
+#   API   : http://localhost:${MS_PORT}/v1  (OpenAI-compatible)
+
+services:
+  moestream:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Which llama.cpp to patch. Defaults to the commit this project was
+        # measured against; set LLAMA_COMMIT=master in .env to track upstream.
+        LLAMA_COMMIT: "${LLAMA_COMMIT:-3581ba0cf591b3f772fbb002de0f70e294bc0396}"
+    image: moestream/server:local
+    container_name: moestream
+
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:-992}"
+      - "${VIDEO_GID:-44}"
+
+    # Pass .env through verbatim; src/entrypoint.sh expands the values.
+    env_file:
+      - .env
+    environment:
+      MOESTREAM_GGUF: "/models/${MODEL_FILE}"
+      XDG_RUNTIME_DIR: /tmp
+
+    volumes:
+      - "${MODEL_DIR}:/models:ro"
+      # Writable state. Used by MOESTREAM_CACHE_FRAC=learn to remember the slot
+      # count that suits this workload, so the next start applies it directly.
+      - "./state:/state"
+
+    ports:
+      - "${MS_PORT:-8091}:8080"
+
+    restart: unless-stopped
+
+    healthcheck:
+      # /dev/tcp is a bash extension and the image's /bin/sh is dash.
+      # Neither curl nor wget is installed, so use python3.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 300s

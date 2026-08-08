@@ -1,0 +1,56 @@
+# MoEStream development / verification image
+#
+# Policy (Appendix F):
+#   - no toolchain on the host; every build happens inside this image
+#   - no models (.msp/.gguf) in the image; they are always supplied externally
+#   - no reliance on bind mounts (artifacts come out via docker cp)
+#
+# ggml is pinned to a specific commit, equivalent to vendoring (§32.4).
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION}
+
+ARG GGML_COMMIT=78de606907c364b76601f734021f76bd29ca5637
+ARG WITH_VULKAN=OFF
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git ca-certificates pkg-config python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Added only for the Vulkan backend (--build-arg WITH_VULKAN=ON).
+# ggml-vulkan calls find_package(SPIRV-Headers), so spirv-headers is required.
+RUN if [ "$WITH_VULKAN" = "ON" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            libvulkan-dev glslc glslang-tools spirv-headers spirv-tools \
+            mesa-vulkan-drivers vulkan-tools libvulkan1 \
+        && rm -rf /var/lib/apt/lists/* ; \
+    fi
+
+WORKDIR /opt
+
+# --- fetch and build ggml at a pinned commit (this layer is cacheable) ---
+RUN git clone https://github.com/ggml-org/ggml.git ggml \
+    && cd ggml \
+    && git checkout ${GGML_COMMIT}
+
+RUN cmake -S /opt/ggml -B /opt/ggml/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_VULKAN=${WITH_VULKAN} \
+        -DGGML_BUILD_TESTS=OFF \
+        -DGGML_BUILD_EXAMPLES=OFF \
+    && cmake --build /opt/ggml/build -j"$(nproc)" --target ggml \
+    && if [ "$WITH_VULKAN" = "ON" ]; then \
+           cmake --build /opt/ggml/build -j"$(nproc)" --target ggml-vulkan ; \
+       fi \
+    && echo "ggml build done" \
+    && find /opt/ggml/build -name 'libggml*.so*' -printf '%f\n'
+
+ENV GGML_ROOT=/opt/ggml
+
+# io_uring (§23). Placed after the ggml build so its layer cache stays valid.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        liburing-dev liburing2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work

@@ -1,0 +1,18 @@
+# The product image needs only src/.
+# Measurement, verification and records are all excluded, so the boundary is
+# enforced mechanically rather than by convention.
+docs/
+imgs/
+bench/
+spikes/
+tools/
+research/
+Makefile
+.git/
+**/build/
+*.gguf
+*.msp
+*.trace
+.env
+.env.bak.*
+state/

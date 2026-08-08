@@ -1,0 +1,44 @@
+# ---- local configuration -----------------------------------------------------
+# .env holds machine-specific values such as model paths and GIDs.
+# .env.example is what gets distributed.
+.env
+.env.bak.*
+
+# ---- reference clones --------------------------------------------------------
+# The Dockerfile fetches llama.cpp and ggml at a pinned commit during the build.
+# A clone in the working tree is not part of the distribution (over 200 MB).
+vendor/
+
+# ---- build artifacts ---------------------------------------------------------
+build/
+*.o
+*.so
+*.a
+*.spv
+
+# ---- raw measurement data ----------------------------------------------------
+# Traces run to tens or hundreds of MB. The summaries live in docs/findings/.
+*.bin
+*.trace
+traces/
+# Analysis summaries (research/bench/*_analysis.json) are kept: they are primary data
+# such as MRC curves, and more reusable than prose.
+!research/bench/*_analysis.json
+
+# ---- learned tuning state ----------------------------------------------------
+# Written by MOESTREAM_CACHE_FRAC=learn. Machine- and workload-specific.
+state/*
+!state/README
+
+# ---- temporary files ---------------------------------------------------------
+*.log
+*.tmp
+.DS_Store
+__pycache__/
+*.pyc
+
+# ---- Japanese originals ------------------------------------------------------
+# The documents were written in Japanese first and translated. The Japanese
+# versions are kept locally as the author's working copy; the published
+# documents are the English ones (docs/*.md without the .ja suffix).
+*.ja.md

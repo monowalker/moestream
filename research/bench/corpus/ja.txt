@@ -1,0 +1,5185 @@
+# MoEStream — Design Document
+
+> **MoE 専用・省メモリ SSD ストリーミング推論ランタイム**
+> Design Document v0.1 (Draft for RFC) — 2026-08
+
+| 項目 | 内容 |
+|---|---|
+| プロジェクト名 | MoEStream (仮) |
+| ステータス | Design RFC / 実装前 |
+| ライセンス方針 | Apache-2.0 |
+| 主要ターゲット | 30B〜70B クラス MoE (active 3B〜12B) |
+| PoC 対象 | Qwen3.6-35B-A3B (40L / 256E / top-8 + shared1 / hybrid GDN) |
+| 主要 OS | Linux (Ubuntu 24.04+), NVMe PCIe 4.0+ |
+| 主要 GPU Backend | Vulkan (第一級) → CUDA / ROCm / Metal |
+| 設計上の第一目標 | **RAM 使用量の決定論的上限化 (22 GB → 10 GB)** |
+| 設計上の第二目標 | **フル RAM 比 20% 以内の速度低下** |
+
+---
+
+## 目次
+
+1. [プロジェクト概要](#1-プロジェクト概要)
+2. [背景](#2-背景)
+3. [Colibri との差別化](#3-colibri-との差別化)
+4. [要求仕様](#4-要求仕様)
+5. [非要求仕様](#5-非要求仕様)
+6. [設計思想](#6-設計思想)
+7. [システム全体構成](#7-システム全体構成)
+8. [コンポーネント設計](#8-コンポーネント設計)
+9. [Model Adapter 設計](#9-model-adapter-設計)
+10. [Runtime Core 設計](#10-runtime-core-設計)
+11. [Expert Manager 設計](#11-expert-manager-設計)
+12. [Cache Manager 設計](#12-cache-manager-設計)
+13. [Storage Backend 設計](#13-storage-backend-設計)
+14. [GPU Backend 設計](#14-gpu-backend-設計)
+15. [Thread Model](#15-thread-model)
+16. [Scheduler](#16-scheduler)
+17. [Memory Layout](#17-memory-layout)
+18. [SSD Layout](#18-ssd-layout)
+19. [Metadata 設計](#19-metadata-設計)
+20. [推論シーケンス](#20-推論シーケンス)
+21. [キャッシュ戦略](#21-キャッシュ戦略)
+22. [Prefetch 戦略](#22-prefetch-戦略)
+23. [非同期 I/O](#23-非同期-io)
+24. [GPU 転送](#24-gpu-転送)
+25. [API 設計](#25-api-設計)
+26. [マルチ Agent 対応](#26-マルチ-agent-対応)
+27. [エラー処理](#27-エラー処理)
+28. [ログ・メトリクス](#28-ログメトリクス)
+29. [ディレクトリ構成](#29-ディレクトリ構成)
+30. [クラス設計](#30-クラス設計)
+31. [将来拡張](#31-将来拡張)
+32. [技術的課題](#32-技術的課題)
+33. [ベンチマーク設計](#33-ベンチマーク設計)
+34. [開発ロードマップ](#34-開発ロードマップ)
+35. [OSS 公開を前提とした設計指針](#35-oss-公開を前提とした設計指針)
+- [Appendix A: 記号表と解析モデル](#appendix-a-記号表と解析モデル)
+- [Appendix B: Qwen3.6-35B-A3B 実数値表](#appendix-b-qwen3635b-a3b-実数値表)
+- [Appendix C: 用語集](#appendix-c-用語集)
+- [Appendix D: 設計判断記録 (ADR) インデックス](#appendix-d-設計判断記録-adr-インデックス)
+- [Appendix E: UMA / iGPU 実機プロファイルと固有設計](#appendix-e-uma--igpu-実機プロファイルと固有設計) ★実測
+- [Appendix F: コンテナ / Docker 運用要件](#appendix-f-コンテナ--docker-運用要件)
+
+---
+
+## 1. プロジェクト概要
+
+### 1.1 一文要約
+
+**MoEStream は、Mixture-of-Experts モデルの Expert 重みを NVMe SSD 上に置いたまま、
+「I/O を完全に計算の影に隠す」ことで、RAM 使用量を宣言的な上限内に固定しつつ
+フル RAM 推論に近い速度を維持する、MoE 専用ランタイムである。**
+
+### 1.2 何をするものか
+
+一般的な MoE モデルでは、パラメータの 90% 以上が Expert FFN に集中している。
+Qwen3.6-35B-A3B の場合、実測構成から計算すると:
+
+| 区分 | パラメータ数 | Q4_K_M サイズ | 全体比 |
+|---|---:|---:|---:|
+| Routed Experts (40層 × 256体) | 32.21 B | **19.45 GiB** | 90.5% |
+| Shared Experts (40層 × 1体) | 0.126 B | 76 MiB | 0.3% |
+| Embedding (in) | 0.508 B | 546 MiB | 2.5% |
+| LM Head (out, untied) | 0.508 B | 636 MiB (Q6_K) | 2.9% |
+| Attention / GatedDeltaNet | ≈0.70 B | ≈470 MiB | 2.1% |
+| Router / Norm (FP16 保持) | 0.021 B | 42 MiB | 0.2% |
+| **合計** | **≈34.1 B** | **≈21.3 GiB** | 100% |
+
+一方、1 トークンの生成で実際に必要な Routed Expert は
+`40 層 × 8 体 = 320 体` = **622 MiB**(全 Expert の 3.1%)に過ぎない。
+
+MoEStream は、この **「常駐必要量 ≠ 総容量」** という MoE 固有の構造を
+ストレージ階層に対して忠実にマッピングする。
+
+```
+              従来 (llama.cpp フル常駐)              MoEStream
+        ┌────────────────────────────┐      ┌────────────────────────────┐
+RAM     │ 21.3 GiB 重み + KV + 実行時 │      │ 1.05 GiB Dense 常駐        │
+        │                            │      │ 7.65 GiB Expert Cache (可変)│
+        │        ≈ 22 GB             │      │ 1.30 GiB KV/state/scratch  │
+        └────────────────────────────┘      │        ≤ 10.0 GiB (宣言値) │
+                                            └────────────────────────────┘
+SSD     │ (mmap 元ファイル / page cache) │      │ 21.3 GiB .msp コンテナ     │
+                                            │ 実効読出 0.27 GiB/token    │
+```
+
+### 1.3 想定ユースケース
+
+| # | ユースケース | なぜ MoEStream が必要か |
+|---|---|---|
+| U1 | 32 GB RAM のミニ PC / ノート PC で 35B MoE を常時起動 | 22 GB 常駐だとブラウザ・IDE と共存できない。10 GB なら共存できる |
+| U2 | 複数の自律 Agent が同一モデルへ同時アクセス | プロセスごとに 22 GB は不可能。1 デーモン + 共有 Expert Cache で N Agent |
+| U3 | iGPU (Radeon 780M / Arc / Apple) 環境 | UMA では VRAM = RAM。重み常駐を減らすことが直接的に GPU 予算を増やす |
+| U4 | 常駐サービス化 (systemd / コンテナ) | ホスト全体のメモリ予算に対して**上限を約束できる**ことが運用要件 |
+| U5 | 同一マシンで複数 MoE モデルを保持 | 2 モデル × 10 GB は可能だが、2 × 22 GB は不可能 |
+
+### 1.4 非目標の先出し
+
+MoEStream は **「動かないものを動かす」プロジェクトではない**。
+35B クラスは 22 GB あれば既に動く。MoEStream の価値は
+**「動くが占有しすぎる」を「動きつつ共存できる」に変える** ことにある。
+この立ち位置の違いが、後述する Colibri 系との設計上のすべての分岐点になる。
+
+---
+
+## 2. 背景
+
+### 2.1 MoE の構造的性質
+
+Dense モデルでは「総パラメータ = 毎トークン読むバイト数」だが、
+MoE では両者が 1〜2 桁乖離する。これがストリーミングを成立させる唯一の物理的根拠である。
+
+| モデル | 総 params | active params | 総 Expert bytes (Q4) | **active Expert bytes / token** |
+|---|---:|---:|---:|---:|
+| Mixtral-8x7B | 46.7 B | 12.9 B | 22.5 GiB | 5.6 GiB (top-2 / 8) |
+| Qwen3-30B-A3B | 30.5 B | 3.3 B | 17.0 GiB | 1.06 GiB (top-8 / 128) |
+| **Qwen3.6-35B-A3B** | **35 B** | **3 B** | **19.45 GiB** | **0.61 GiB (top-8 / 256)** |
+| GLM-4.5-Air-106B-A12B | 106 B | 12 B | ≈57 GiB | ≈2.6 GiB |
+| DeepSeek-V3-671B-A37B | 671 B | 37 B | ≈370 GiB | ≈11 GiB |
+| GLM-5.2-744B-A40B | 744 B | 40 B | ≈370 GiB | ≈11 GiB |
+
+最右列 **active Expert bytes / token (以下 `B_act`)** が、
+SSD ストリーミング設計における唯一の支配変数である。
+
+### 2.2 支配方程式 — 2 つのレジーム
+
+SSD 帯域を `BW`、フル RAM 時の 1 トークン計算時間を `t_c`、Expert キャッシュヒット率を `h` とする。
+I/O と計算が完全にオーバーラップできる理想系では、1 トークンの所要時間は
+
+```
+t_step = max( t_c ,  B_act · (1 − h) / BW )
+```
+
+ここから 2 つの本質的に異なるレジームが現れる。
+
+```mermaid
+graph LR
+    subgraph RegimeA["Regime A: I/O 律速 — B_act/BW ≫ t_c"]
+        A1["帯域が全て<br/>tok/s = BW / B_act"]
+        A2["設計目標:<br/>生バイト帯域の最大化"]
+        A3["典型: 700B級<br/>0.05〜1 tok/s"]
+    end
+    subgraph RegimeB["Regime B: レイテンシ秘匿律速 — B_act/BW ≲ t_c"]
+        B1["理論上 I/O は<br/>完全に隠せる"]
+        B2["設計目標:<br/>ストール率ゼロの保証"]
+        B3["典型: 35B級<br/>20〜30 tok/s"]
+    end
+    RegimeA -.->|"B_act が 1/20 になると<br/>問題の性質が変わる"| RegimeB
+```
+
+**Qwen3.6-35B-A3B, Gen4 NVMe (6 GB/s), t_c = 40 ms の場合:**
+
+```
+B_act / BW = 0.61 GiB / 6 GB/s = 109 ms      (h = 0, 完全コールド)
+                                              → 冷えている間だけ Regime A
+B_act·(1−h)/BW ≤ t_c  ⟺  h ≥ 1 − (6 GB/s × 40 ms)/0.652 GB
+                       ⟺  h ≥ 63.2%           → これを超えた瞬間 Regime B
+```
+
+つまり **35B-A3B クラスは、ヒット率 63% を境に I/O 律速から計算律速へ相転移する**。
+そして 39% の Expert を RAM 常駐できる 10 GiB 予算下で 63% のヒット率は
+**十分に到達可能な水準**である(§21 で根拠を示す)。
+
+これが本プロジェクトの成立根拠であり、同時に
+**設計目標が「帯域最大化」ではなく「テールレイテンシとストール率の制御」である理由**でもある。
+
+### 2.3 目標達成に必要なヒット率 (定量)
+
+`t_step ≤ 1.2 · t_c` (速度低下 20% 以内) を満たす条件:
+
+| SSD 帯域 | 世代 | 1 token あたり許容 I/O | 必要ヒット率 `h` | 必要常駐 Expert 数 (10,240 中) |
+|---|---|---:|---:|---:|
+| 2.0 GB/s | SATA SSD | 96 MB | **85.3%** | 到達困難 (要 Q2 tier) |
+| 3.5 GB/s | PCIe 3.0 x4 | 168 MB | **74.3%** | ≈6,000 (11.4 GiB) |
+| 6.0 GB/s | **PCIe 4.0 x4** | 288 MB | **55.9%** | ≈4,000 (7.6 GiB) ✅ |
+| 12.0 GB/s | PCIe 5.0 x4 | 576 MB | **11.7%** | ≈1,000 (1.9 GiB) |
+| 14.0 GB/s | PCIe 5.0 (上位) | 672 MB | **0%** (コールドでも達成) | — |
+
+> **設計上の重要な帰結**: PCIe 4.0 NVMe + 7.6 GiB Expert Cache が
+> 「10 GB 予算 / 20% 低下」目標のスイートスポットである。
+> PCIe 5.0 環境ではキャッシュはほぼ不要になり、代わりに
+> **RAM 予算をさらに 4 GB 程度まで削れる**(§31.6 の Ultra-Low-RAM モード)。
+
+### 2.4 バッチングによる I/O 増幅の緩和
+
+同時実行シーケンス数 `B` に対し、1 層で必要となる **相異なる** Expert 数 `d(B)` は
+一様ルーティング仮定で `d(B) = E·(1 − (1 − k/E)^B)`。E=256, k=8:
+
+| B (同時トークン数) | d(B) | 層あたり I/O | **token あたり I/O** | B=1 比 |
+|---:|---:|---:|---:|---:|
+| 1 | 8.0 | 15.6 MiB | 15.6 MiB | 1.00 |
+| 2 | 15.8 | 30.7 MiB | 15.4 MiB | 0.98 |
+| 4 | 30.5 | 59.3 MiB | 14.8 MiB | 0.95 |
+| 8 | 58.0 | 112.8 MiB | 14.1 MiB | 0.90 |
+| 16 | 105.0 | 204.3 MiB | 12.8 MiB | 0.82 |
+| 32 | 176.2 | 342.8 MiB | 10.7 MiB | 0.69 |
+| 64 | 231.4 | 450.2 MiB | 7.0 MiB | 0.45 |
+
+**重要な発見**: 256-expert / top-8 のような **fine-grained MoE では、
+小バッチ域でのバッチング利得はほとんどない**(B=8 でも 10% 削減)。
+Mixtral (E=8, k=2) では B=8 で 60% 削減できるのと対照的である。
+
+> **帰結 1**: 「バッチングすれば I/O が薄まる」という直観は fine-grained MoE には効かない。
+> したがって **キャッシュと予測が唯一の主兵装** である。
+> **帰結 2**: 逆に、Expert 粒度が細かい (1.94 MiB) ことは
+> キャッシュ効率とスケジューリング自由度の面で**極めて有利**である(§2.5)。
+> **帰結 3**: 投機的デコード (§31.1) は、同一の residual から複数トークンを検証するため
+> `d(B)` を増やさずに B を増やせる、fine-grained MoE における唯一の実効的な I/O 償却手段。
+
+### 2.5 「35B クラスだから最適になる」設計上の非連続点
+
+| 性質 | 35B-A3B (E=256, 1.94 MiB/expert) | 700B級 (E=160, 30〜60 MiB/expert) | 設計への影響 |
+|---|---|---|---|
+| Expert オブジェクト数 | 10,240 | ≈8,000 だが 1 個が巨大 | **10,240 × 64 B = 640 KiB で完全統計が持てる** → 近似スケッチ (CM-Sketch) 不要、厳密 LFU が可能 |
+| Expert サイズ | 1.94 MiB | 30〜60 MiB | NVMe の効率的読出単位 (≥128 KiB) を超え、かつ**キャッシュ粒度として細かい**という理想帯 |
+| 共活性化行列 | 256² × 40 × u16 = 5.1 MiB | 保持可能だが利得薄 | **層ごとの共活性化グラフを常時保持でき、群単位プリフェッチが可能** |
+| 全モデル SSD 常駐 | 21 GiB (常識的) | 370 GiB (SSD 容量を圧迫) | **モデルの複数保持・ホットスワップが現実的** |
+| `B_act/BW` | 0.10 s | 1.8 s | Regime B に入れる ⇒ **目標が速度ではなく「ジッタ制御」になる** |
+| KV Cache | hybrid で 10 層のみ = 10 KiB/token | 全層 = 数百 KiB/token | **RAM 予算のほぼ全量を Expert Cache に回せる** |
+
+この表の各行が、そのまま §11〜§22 の設計判断の根拠になる。
+
+---
+
+## 3. Colibri との差別化
+
+> **出典に関する注記**: 本章の Colibri に関する数値は 2026 年 7〜8 月時点の
+> 公開情報(プロジェクトページおよび第三者ベンチマーク記事)に基づく。
+> 実装内部の詳細については推測を含むため、比較は **「設計目標と観測された動作特性」**
+> のレベルに限定し、内部実装への断定は避けている。
+> 実装が変化した場合は本章を更新すること (`docs/adr/0003-positioning.md` で追跡)。
+
+### 3.1 Colibri の位置づけ (公開情報の要約)
+
+| 項目 | 値 |
+|---|---|
+| 実装 | Pure C, ≈2,400 行, 依存ゼロ |
+| ライセンス | Apache-2.0 |
+| 対象 | GLM-5.2 744B-A40B ほか frontier MoE |
+| RAM 常駐 | ≈9.9 GB (dense int4) |
+| SSD チェックポイント | ≈370 GB |
+| 観測速度 | 0.05〜0.1 tok/s (外付け/コールド) 〜 0.8 tok/s (内蔵 NVMe) |
+| 1 token あたり読出量 | ≈11 GB |
+
+Colibri は **「本来動かないものを動かす」** という価値を極めて高い完成度で実現している。
+2,400 行という実装規模は、そのミニマリズムが意図的な設計思想であることを示す。
+
+### 3.2 両者は同じ問題の大小版ではない
+
+```mermaid
+graph TB
+    subgraph C["Colibri の制約構造"]
+        C1["B_act = 11 GB/token"] --> C2["BW=6GB/s なら<br/>物理下限 1.8 s/token"]
+        C2 --> C3["キャッシュしても<br/>370GB 中 10GB = 2.7%<br/>ヒット率は原理的に低い"]
+        C3 --> C4["⇒ 最適化は<br/>「1 バイトも無駄に読まない」"]
+    end
+    subgraph M["MoEStream の制約構造"]
+        M1["B_act = 0.65 GB/token"] --> M2["BW=6GB/s なら<br/>物理下限 0.109 s/token<br/>= 計算時間 0.040 s の 2.7 倍"]
+        M2 --> M3["21GB 中 7.6GB = 36%<br/>ヒット率 60〜85% が射程"]
+        M3 --> M4["⇒ 最適化は<br/>「1 回もストールしない」"]
+    end
+    C4 -.->|"最適化対象が<br/>スループット→テールレイテンシに<br/>変わるため設計が非連続"| M4
+```
+
+**結論: Colibri を 35B 向けにチューニングしても MoEStream にはならない。**
+最適化対象が「平均帯域」から「p99 ストール」へ移るため、
+必要なコンポーネント(予測器、到着順実行、デッドラインスケジューラ、共有デーモン)が
+そもそも Colibri の問題設定には存在しない。
+
+### 3.3 設計判断の比較表
+
+| 軸 | Colibri 系 (超巨大モデル志向) | **MoEStream** | 理由 |
+|---|---|---|---|
+| 第一目標 | **実行可能性** (動くこと) | **RAM 上限の決定論性** | 35B は既に動く。共存が価値 |
+| 第二目標 | 平均スループット | **p99 トークン間レイテンシ** | Agent 用途では待ち時間分布が UX |
+| メモリ制御 | 概ね OS 任せ + 自前 dense 常駐 | **全アロケーションを予算管理下に置く** | `--mem-budget` を守る契約 |
+| I/O | 逐次読出の効率化 | **io_uring + O_DIRECT + 予測プリフェッチ** | ストール回避が主目的 |
+| 実行順序 | 層順・Expert 順 | **Expert 到着順 (out-of-order accumulate)** | 和の可換性を利用しHOLブロッキング除去 |
+| プロセスモデル | 単一プロセス CLI | **常駐デーモン + マルチセッション** | N Agent が 1 キャッシュを共有 |
+| 対応モデル | 主要モデルへ個別対応 | **宣言的 Model Spec + Adapter** | DeepSeek/GLM/Mixtral/hybrid を data で吸収 |
+| 計算カーネル | 自前実装 (Pure C) | **既存 (GGML) を無改造で再利用** | 差別化はメモリ/IO 層。カーネル競争はしない |
+| コード規模想定 | ≈2.4 kLoC | ≈25〜35 kLoC | 目標が違うので当然増える。ミニマリズムは非目標 |
+| 想定 tok/s | 0.05〜0.8 | **20〜30** | レジームの違い |
+
+### 3.4 補完関係の明示 (OSS 政治的に重要)
+
+MoEStream は Colibri の競合ではなく **カバー範囲の異なる兄弟プロジェクト** である。
+README・論文・発表では常に以下を明示する:
+
+> - 700B 級を 32 GB で動かしたい → **Colibri を使うべき**
+> - 30〜70B 級を 10 GB で「実用速度のまま」動かしたい → **MoEStream**
+> - 十分な RAM がある → **llama.cpp / vLLM をそのまま使うべき**
+
+この 3 分岐を README 冒頭に置き、
+**ユーザを他プロジェクトへ積極的に送客する**ことをプロジェクト規範とする(§35.6)。
+
+### 3.5 その他の関連システムとの位置づけ
+
+| システム | 関係 | MoEStream の差分 |
+|---|---|---|
+| **llama.cpp** (`--n-cpu-moe`, `--override-tensor`) | 計算バックエンドとして依存 | llama.cpp は「どのテンソルを CPU/GPU に置くか」の静的分割。MoEStream は**動的・予測駆動・上限保証** |
+| **llama.cpp mmap + page cache** | 最も近い既存代替 | page cache は RAM 上限を保証できず、圧力下で予測不能にスラッシュする。MoEStream は O_DIRECT で page cache を回避し**自前で上限を守る** |
+| **KTransformers** | 思想的に近い (CPU/GPU ハイブリッド MoE) | KTransformers は DRAM 常駐前提。MoEStream は SSD 階層が主戦場 |
+| **Mixtral-offloading** (Eliseev & Mazur) | LRU + speculative expert loading の先行研究 | 単一予測器 + 単一セッション。MoEStream は**多重予測器融合 + マルチセッション + デッドライン制御** |
+| **MoE-Infinity** | シーケンス単位 Expert Activation Matrix の先行研究 | EAM の考え方を P4 予測器として取り込む (§22.5)。加えて到着順実行と厳密メモリ予算を追加 |
+| **ProMoE / Klotski / LayerScope / FineMoE** | 予測プリフェッチ・パイプライン最適化の先行研究 | 各手法を**予測器プラグインとして共存させ、実測で重みを学習する**メタ設計 (§22.6) |
+| **vLLM / SGLang** | Continuous Batching / PagedAttention の設計を採用 | データセンター向け。MoEStream は単一ノード・低 RAM・SSD 階層に特化 |
+| **DeepSpeed ZeRO-Inference** | パラメータ offload の先行研究 | Dense 志向・学習寄り。MoE ルーティングの疎性を活用しない |
+
+---
+
+## 4. 要求仕様
+
+要求は **測定可能な受入基準**を伴う形でのみ記述する。
+基準を書けない要求は要求として採用しない (§35.3 の規範)。
+
+### 4.1 機能要求 (FR)
+
+| ID | 要求 | 受入基準 |
+|---|---|---|
+| FR-1 | Qwen3.6-35B-A3B (GGUF Q4_K_M) の推論 | `moestream run` でテキスト生成が完了する |
+| FR-2 | OpenAI 互換 HTTP API | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/embeddings` が OpenAI SDK から利用可能。SSE ストリーミング対応 |
+| FR-3 | マルチセッション同時実行 | 4 セッション同時、単一 Expert Cache を共有、セッション間で KV/state は完全分離 |
+| FR-4 | 宣言的メモリ予算 | `--mem-budget 10GiB` 指定時、プロセス RSS が全実行中 10 GiB を超えない |
+| FR-5 | GGUF 直読み | 変換なしで GGUF を読める (性能は劣化してよい) |
+| FR-6 | `.msp` パック形式 | `moestream pack model.gguf` で最適化コンテナを生成 |
+| FR-7 | 新規 MoE アーキ対応 | 既存プリミティブのみで表現できるモデルは **Model Spec (TOML) の追加のみ**でコア変更不要 |
+| FR-8 | Storage/GPU Backend 差替 | 実行時フラグでバックエンド選択、コア再ビルド不要 |
+| FR-9 | 観測性 | Prometheus `/metrics`、per-expert ヒート統計のダンプ |
+| FR-10 | グレースフルな品質モード | `strict` / `soft` / `turbo` の品質-遅延契約を API で選択可能 |
+
+### 4.2 性能要求 (PR) — PoC 基準機
+
+> 基準機: Ryzen 8845HS (Radeon 780M, iGPU) / DDR5-5600 32 GB / Samsung 990 PRO 2 TB (PCIe 4.0)
+> 比較対象: 同一マシン・同一 GGUF・同一 GGML Vulkan バックエンドでの llama.cpp フル常駐
+
+| ID | 指標 | 目標 | 必達ライン |
+|---|---|---|---|
+| PR-1 | Peak RSS (bs=1, ctx 8K) | **≤ 10.0 GiB** | ≤ 10.0 GiB (ハード制約) |
+| PR-2 | Decode tok/s (bs=1, ctx 4K, ウォーム) | ≥ **80%** of baseline | ≥ 70% |
+| PR-3 | TTFT (2K prompt, コールド) | ≤ `モデルサイズ/実測逐次帯域 × 1.3` | ≤ 8 s |
+| PR-4 | TTFT (2K prompt, ウォーム) | ≤ baseline × 1.5 | ≤ baseline × 2.0 |
+| PR-5 | p99 / median トークン間レイテンシ | ≤ **2.0** | ≤ 3.0 |
+| PR-6 | 4 セッション時 合計 tok/s | ≥ 単一セッション × 2.5 | ≥ × 2.0 |
+| PR-7 | Expert Cache ヒット率 (ウォーム, bs=1) | ≥ **70%** | ≥ 60% |
+| PR-8 | ストール率 (I/O 待ちで計算が止まった時間 / 総時間) | ≤ **5%** | ≤ 15% |
+| PR-9 | 16 GiB 予算での動作 | RSS ≤ 6 GiB, tok/s ≥ baseline × 0.5 | 動作すること |
+
+### 4.3 正確性要求 (QR)
+
+| ID | 要求 | 受入基準 |
+|---|---|---|
+| QR-1 | `strict` モードでの数値同一性 | **同一バックエンド**・同一量子化・同一シードにおいて、フル常駐実行と MoEStream のストリーミング実行の logits が **bit-exact**。CI で 256 トークン検証 |
+| QR-2 | `soft` モードの品質劣化上限 | WikiText-2 perplexity 劣化 ≤ **1.0%**、MMLU 劣化 ≤ **0.5 pt** |
+| QR-3 | `turbo` モードの品質劣化上限 | perplexity 劣化 ≤ 3.0%、劣化量を必ずログに出す |
+| QR-4 | 破損検出 | `.msp` の per-expert チェックサム検証を `--verify` で提供 |
+
+> **QR-1 の補足 (Finding S0b)**: バックエンドが異なると fp16 累算・縮約順序の違いで
+> bit-exact は原理的に達成できない (Vulkan vs CPU で Q4_K の相対RMS 0.0038 を実測)。
+> QR-1 が保証するのは **「MoEStream が導入する非決定性はゼロ」** という点であり、
+> S0/S0b の置換不変性テストと S1 の実モデル MoE FFN 一致で既に実証済み。
+
+> **QR-1 は本プロジェクト最大の差別化要素**である。
+> 「省メモリ化したら答えが変わった」を許さないことが、Agent 用途での信頼の基盤になる。
+> `soft`/`turbo` は明示的オプトインでのみ有効化される。
+
+### 4.4 移植性・運用要求 (OR)
+
+| ID | 要求 |
+|---|---|
+| OR-1 | Linux x86-64 / aarch64 を第一級サポート。glibc 2.35+ / kernel 5.15+ (io_uring)。kernel 6.1+ 推奨 |
+| OR-2 | io_uring 不可環境では `pread + threadpool` バックエンドへ自動フォールバック |
+| OR-3 | 単一静的バイナリ配布 (musl 版を含む)。ランタイム依存は Vulkan loader のみ |
+| OR-4 | ルート権限不要。HugePages は利用可能なら使い、なければ THP へフォールバック |
+| OR-5 | コンテナ内動作 (cgroup v2 メモリ制限と `--mem-budget` を整合させる) |
+| OR-6 | 設定は CLI フラグ / 環境変数 / TOML の 3 経路、優先度は左が高い |
+
+---
+
+## 5. 非要求仕様
+
+「やらないこと」を明示的に凍結する。将来変更する場合は ADR を必要とする。
+
+### 5.1 スコープ外 (v1.0 において)
+
+| ID | 非目標 | 理由 |
+|---|---|---|
+| NG-1 | **学習・ファインチューニング** | 推論ランタイムに徹する。読み取り専用であることが I/O 設計を単純化する |
+| NG-2 | **マルチノード分散** | 単一ノードの RAM 削減が目的。分散は問題を解決せず複雑性だけ増やす |
+| NG-3 | **100B 超モデルの最適化** | 動作はするが Regime A に入り、本設計の前提が崩れる。Colibri へ送客する |
+| NG-4 | **Dense モデルの最適化** | Dense は `B_act = 総サイズ` でストリーミングが原理的に成立しない。互換動作のみ |
+| NG-5 | **独自 GEMM カーネルの実装** | GGML/BLAS に劣後する。差別化点ではない |
+| NG-6 | **独自量子化形式の発明** | GGUF の Q4_K/Q6_K/IQ 系をそのまま使う。再量子化はしない |
+| NG-7 | **PyTorch → GGUF 変換** | llama.cpp の `convert_hf_to_gguf.py` を使う |
+| NG-8 | **Windows ネイティブ第一級対応** | v1 は WSL2 経由。ネイティブは v2 (§31.8) |
+| NG-9 | **データセンター規模スループット競争** | vLLM/SGLang の土俵。並行数 ≤ 16 を想定 |
+| NG-10 | **動的ロード可能なバイナリプラグイン ABI** | v1 では静的レジストリのみ。理由は §9.6 |
+| NG-11 | **マルチモーダル (画像/音声)** | v2 以降。ただし Adapter 設計は将来の非テキスト入力を排除しない |
+| NG-12 | **GPUDirect Storage の v1 採用** | iGPU/UMA では原理的に無意味。コンシューマ環境で P2P DMA の可用性が低い (§13.7) |
+
+### 5.2 意図的に採用しない設計
+
+| 採用しないもの | 理由 |
+|---|---|
+| **mmap + OS page cache を主機構とすること** | RAM 上限を保証できない。カーネルが我々のホット Expert をいつでも追い出せる。FR-4 と両立しない (§13.2 に詳細分析) |
+| **プレーン LRU** | Expert アクセスは強く歪んだ再利用分布を持ち、LRU はスキャン耐性が無い。W-TinyLFU/S3-FIFO 系が明確に優る |
+| **層単位のキャッシング** | 1 層 = 486 MiB。粒度が粗すぎ、必要な 8/256 のために 256 体を読むことになる |
+| **Tensor 単位 (gate/up/down 個別) のキャッシング** | 3 体は常に同時に必要。3 倍のメタデータと 3 倍の I/O 発行コストを払う意味がない。**Expert 単位が唯一の正しい粒度** |
+| **デフォルトでの Expert スキップ (品質妥協)** | QR-1 を破壊する。明示オプトインのみ |
+| **推論結果のキャッシュ (prompt cache) を v1 に含めること** | 直交する機能。KV 再利用は v1.1 で扱う |
+
+---
+
+## 6. 設計思想
+
+以下 10 原則は、実装上のあらゆる判断の上位規範とする。
+PR レビューで「どの原則に基づくか」を問える粒度で書いている。
+
+### P1. メモリは「結果」ではなく「予算」である
+
+> RAM 使用量は測定して報告するものではなく、**入力として与えられ、守られるもの**。
+
+すべてのアロケーションは `MemoryGovernor` を通す。予算外の malloc をコア内で行わない。
+Expert Cache は「余った分を使う」のではなく「割り当てられた分だけ使う」。
+この原則が page cache 依存を排除する直接の理由になっている。
+
+### P2. `bytes/token` が唯一のマスター指標である
+
+tok/s は環境依存だが、`実効 SSD 読出バイト / 生成トークン` はアルゴリズムの質を直接表す。
+すべての最適化はこの数値の削減として説明できなければならない。
+ダッシュボードの最上段に置く (§28.3)。
+
+### P3. I/O は計算をブロックしてはならない
+
+同期的なページフォルトも、順序制約による待ちも、設計上の欠陥として扱う。
+唯一許される待ちは「予測が外れた場合のデマンドフェッチ」であり、
+その発生頻度 (ストール率) が PR-8 として管理される。
+
+### P4. 順序独立性は資源である
+
+MoE の FFN 出力は `Σ_i w_i · E_i(x)` であり **和の順序に依存しない**。
+これは、Expert を **I/O 完了順に処理してよい** ことを意味する。
+この 1 行の数学的事実が、head-of-line blocking の完全な排除を可能にする (§11.5)。
+本設計で最も価値のある単一の洞察である。
+
+### P5. 予測は反応に優る
+
+デマンドフェッチが発生した時点で既に負けている。
+ルータ出力が確定する前に、複数の独立な予測器から確率的に先行取得する (§22)。
+予測器は**プラグイン可能**で、実測ヒット寄与に基づき動的に重み付けされる。
+
+### P6. 計算は借り、メモリは自分で持つ
+
+GEMM・量子化カーネル・Attention は GGML から**無改造で**借りる。
+差別化は Cache/IO/Scheduler にあり、そこに全工数を投下する。
+GGML の `mul_mat_id` を無改造で使うための **Slot Table + ID Remap** (§11.4) は
+この原則の具体化である。
+
+### P7. モデル知識はコードではなくデータに置く
+
+「Qwen3.6 は 3:1 の hybrid 構成」「DeepSeek は group-limited routing」といった知識は
+すべて宣言的 Model Spec に記述する。コアに `if (model == qwen)` を 1 行も書かない。
+これは CI で機械的に検査する (§9.7)。
+
+### P8. 観測性は機能である
+
+すべての Expert に対し「いつ何回参照され、いつ載り、いつ落ちたか」を追跡できる。
+キャッシュ研究のためのトレース出力を**第一級の成果物**として提供する。
+これは MoE 研究コミュニティへの貢献であり、OSS としての引力になる。
+
+### P9. 既定は決定論的、近似は明示的
+
+デフォルトでは baseline と bit-exact な結果を返す。
+近似 (Expert スキップ、低精度 tier) は必ずオプトインで、
+かつ**その時点での推定品質影響をレスポンスヘッダに出す**。
+
+### P10. 1 プロセス、多 Agent
+
+「複数プロセスがそれぞれモデルを持つ」ことを最初から不可能にする。
+デーモンが正、ライブラリ利用は同一プロセス内マルチセッションとして扱う。
+共有こそが MoEStream の主要な価値提案の 1 つである (§26)。
+
+### 6.1 原則間のトレードオフ解決順
+
+競合した場合の優先順位を明示する:
+
+```
+P1 (メモリ予算)  >  P9 (決定論)  >  P3 (非ブロッキング)  >  P2 (bytes/token)  >  その他
+```
+
+例: 予算を守るためにキャッシュを縮めるとストールが増える (P1 vs P3) → **P1 が勝つ**。
+例: 品質を守るために Expert をスキップしない結果ストールする (P9 vs P3) → **P9 が勝つ**。
+---
+
+## 7. システム全体構成
+
+### 7.1 レイヤ構造
+
+```mermaid
+graph TB
+    subgraph L5["Interface Layer"]
+        HTTP["OpenAI 互換 HTTP/SSE"]
+        IPC["UDS + SHM Fast Path"]
+        CAPI["C ABI (libmoestream)"]
+        CLI["moestream CLI"]
+    end
+    subgraph L4["Serving Layer"]
+        SESS["Session Manager<br/>(会話状態・KV 所有)"]
+        SCHED["Scheduler<br/>(Continuous Batching / Admission)"]
+        GOV["Memory Governor<br/>(予算配分の唯一の権威)"]
+    end
+    subgraph L3["Runtime Core"]
+        PLAN["Execution Planner<br/>(層プラン → step DAG)"]
+        GRAPH["Graph Builder<br/>(GGML グラフ組立 + ID Remap)"]
+        ADPT["Model Adapter<br/>(宣言的 Model Spec)"]
+    end
+    subgraph L2["Memory / IO Layer  ★MoEStream の中核"]
+        EM["Expert Manager<br/>(状態機械 / refcount / Slot Table)"]
+        CM["Cache Manager<br/>(Admission / Eviction / 層別クォータ)"]
+        PF["Prefetch Engine<br/>(多重予測器融合)"]
+        KVM["KV / State Manager<br/>(Paged KV + GDN state)"]
+    end
+    subgraph L1["Backend Layer"]
+        SB["Storage Backend<br/>io_uring / pread / mmap"]
+        GB["GPU Backend<br/>Vulkan / CUDA / ROCm / Metal / CPU"]
+    end
+    subgraph L0["Physical"]
+        NVME[("NVMe SSD<br/>.msp / .gguf")]
+        RAM[("Host RAM Arena<br/>HugePages")]
+        VRAM[("VRAM / UMA")]
+    end
+
+    HTTP --> SESS
+    IPC --> SESS
+    CAPI --> SESS
+    CLI --> SESS
+    SESS --> SCHED
+    SCHED --> PLAN
+    SCHED -.予算要求.-> GOV
+    GOV -.上限通知.-> CM
+    GOV -.上限通知.-> KVM
+    PLAN --> GRAPH
+    ADPT --> PLAN
+    ADPT --> GRAPH
+    GRAPH --> EM
+    GRAPH --> KVM
+    EM <--> CM
+    CM <--> PF
+    PF --> SB
+    EM --> SB
+    EM --> GB
+    GRAPH --> GB
+    KVM --> GB
+    SB --> NVME
+    CM --> RAM
+    GB --> VRAM
+
+    style L2 fill:#2d3748,stroke:#63b3ed,color:#fff
+    style EM fill:#2b6cb0,color:#fff
+    style CM fill:#2b6cb0,color:#fff
+    style PF fill:#2b6cb0,color:#fff
+```
+
+### 7.2 データ経路 (ホットパス) の俯瞰
+
+```
+                     ┌──────────────── 予測 (先行, 数層先) ────────────────┐
+                     ▼                                                     │
+ Router 出力 ──► Prefetch Engine ──► Cache Manager ──► Storage Backend      │
+   (層 L)          (優先度付与)        (admit 判定)     (io_uring SQE)       │
+                                            │                 │            │
+                                            │                 ▼            │
+                                            │        readv → 3 slabs       │
+                                            │        (gate/up/down)        │
+                                            ▼                 │            │
+ 実行 (層 L) ◄── Expert Manager ◄─── Slot Table ◄──── CQE 完了通知 ─────────┘
+   到着順に                          (expert_id → slot_id)
+   accumulate                              │
+                                           ▼
+                                    GGML mul_mat_id
+                                    (ID 差替のみ、無改造)
+```
+
+### 7.3 プロセスモデル
+
+```mermaid
+graph LR
+    A1["Agent 1<br/>(python)"] -->|HTTP| D
+    A2["Agent 2<br/>(node)"] -->|HTTP| D
+    A3["Agent 3<br/>(rust)"] -->|UDS+SHM| D
+    A4["IDE 拡張"] -->|HTTP| D
+    D["moestreamd<br/>(単一デーモン)"]
+    D --> EC["共有 Expert Cache<br/>7.65 GiB"]
+    D --> K1["KV/state<br/>session 1"]
+    D --> K2["KV/state<br/>session 2"]
+    D --> K3["KV/state<br/>session 3"]
+    D --> K4["KV/state<br/>session 4"]
+    style EC fill:#2b6cb0,color:#fff
+```
+
+**設計判断**: ライブラリ (`libmoestream`) は常に「デーモンを埋め込んだもの」として実装する。
+すなわち **単一プロセス内で複数セッションを持てる同一のコード** がデーモンでも使われる。
+CLI ですら内部的にはセッション 1 個のデーモンである。経路を 1 本にすることで、
+マルチセッション経路がテストされないまま腐ることを防ぐ。
+
+---
+
+## 8. コンポーネント設計
+
+### 8.1 コンポーネント一覧
+
+| # | コンポーネント | 責務 | 依存 | 状態を持つか | スレッド安全性 |
+|---|---|---|---|---|---|
+| C1 | **Session Manager** | 会話状態、トークン列、サンプリング設定、KV ハンドルの所有 | KV Manager | Yes | セッション単位ロック |
+| C2 | **Scheduler** | 実行可能セッションの選択、バッチ構成、admission control、デッドライン管理 | Session Mgr, Memory Governor | Yes | 単一スレッド (イベントループ) |
+| C3 | **Memory Governor** | 全メモリ予算の唯一の配分権威。Expert Cache / KV / scratch の境界を動的調整 | — | Yes | atomic + 稀なロック |
+| C4 | **Execution Planner** | Model Spec から step の実行プラン (層 DAG) を生成、Prefetch ホライズンを決定 | Model Adapter | No (純関数的) | 不変データ |
+| C5 | **Graph Builder** | GGML 計算グラフの構築。Slot ID への ID Remap を挿入 | Model Adapter, Expert Mgr, GPU Backend | 一時 | 実行スレッド専有 |
+| C6 | **Model Adapter** | 宣言的 Model Spec の解釈、テンソル名解決、レイアウト記述 | — | 不変 | 読み取りのみ |
+| C7 | **Expert Manager** | Expert の状態機械、refcount、Slot Table、到着順ディスパッチ | Cache Mgr, Storage, GPU | Yes | lock-free (atomic state) |
+| C8 | **Cache Manager** | admission/eviction ポリシー、層別クォータ、統計、ゴーストリスト | Memory Governor | Yes | shard 化ロック |
+| C9 | **Prefetch Engine** | 予測器の融合、優先度キュー、帯域予算配分 | Expert Mgr, Cache Mgr | Yes | 単一プランナスレッド |
+| C10 | **KV/State Manager** | Paged KV ブロック割当、GDN 再帰状態、SSD スワップ | Memory Governor, Storage | Yes | セッション単位 |
+| C11 | **Storage Backend** | 非同期読出の抽象。io_uring/pread/mmap 実装 | — | Yes | 完了スレッド |
+| C12 | **GPU Backend** | デバイス管理、バッファ確保、転送キュー、GGML backend ラップ | — | Yes | 提出スレッド |
+| C13 | **Telemetry** | メトリクス、トレース、Expert ヒートマップ出力 | 全て (観測のみ) | Yes | lock-free ring |
+| C14 | **API Server** | HTTP/SSE, UDS, admin | Session Mgr | Yes | async runtime |
+
+### 8.2 依存関係の規律
+
+```mermaid
+graph TD
+    API --> SESSION --> SCHED --> PLANNER --> GRAPH
+    GRAPH --> EXPERT --> CACHE --> GOVERNOR
+    EXPERT --> STORAGE
+    EXPERT --> GPUB
+    GRAPH --> GPUB
+    SCHED --> GOVERNOR
+    KV --> GOVERNOR
+    KV --> STORAGE
+    ADAPTER -.読取専用.-> PLANNER
+    ADAPTER -.読取専用.-> GRAPH
+    TELEM -.観測のみ.-> ALL[" (全コンポーネント) "]
+
+    style GOVERNOR fill:#742a2a,color:#fff
+    style ADAPTER fill:#22543d,color:#fff
+```
+
+**不変条件 (CI で検査):**
+- 依存は必ず上から下へ。循環依存はビルドエラー (`cargo-deny` + モジュール境界テスト)。
+- `Model Adapter` は誰にも依存しない。純粋なデータ + 参照透明な問い合わせ。
+- `Memory Governor` は葉ノード。誰も呼ばない、全員が呼ぶ。
+- `Telemetry` は他コンポーネントの動作を変えない (観測が挙動を変えたらバグ)。
+
+### 8.3 コンポーネント境界の設計原則
+
+| 原則 | 具体 |
+|---|---|
+| **ホットパスに仮想呼び出しを置かない** | Storage/GPU Backend は起動時に単型化 (Rust: enum dispatch / 静的ディスパッチ)。抽象化コストをトークンごとに払わない |
+| **所有権を明確にする** | Expert のバイト列を所有するのは Cache Manager のみ。他は `SlotRef` (refcount 付き借用) を持つ |
+| **エラーは境界で型が変わる** | Storage は `IoError`、Cache は `AdmissionRejected`、Core は `StepError`。上位でのみ HTTP エラーへ写像 |
+| **設定は起動時に凍結する** | ホットパスで設定を読まない。変更は新しい不変設定オブジェクトの原子的差替 |
+
+---
+
+## 9. Model Adapter 設計
+
+### 9.1 問題設定
+
+MoE モデル間で変動する要素を列挙すると:
+
+| 変動軸 | Qwen3.6-35B-A3B | DeepSeek-V3 | Mixtral-8x22B | GLM-4.5-Air |
+|---|---|---|---|---|
+| 層数 | 40 | 61 | 56 | 46 |
+| Expert 数 / 層 | 256 | 256 | 8 | 128 |
+| top-k | 8 | 8 | 2 | 8 |
+| Shared Expert | 1 | 1 | なし | 1 |
+| Dense 層 (先頭) | 0 | 3 | 0 | 1 |
+| Router 活性化 | sigmoid | sigmoid + bias | softmax | sigmoid |
+| top-k 正規化 | あり | あり (group 内) | あり | あり |
+| Group-limited routing | なし | あり (node-limited) | なし | なし |
+| Attention | GQA (16/2, hd=256) | **MLA** | GQA | GQA + partial RoPE |
+| 層タイプの混在 | **GDN×3 : Attn×1** | 均一 | 均一 | 均一 |
+| MTP head | なし | あり | なし | あり |
+
+**この表の全セルをコード分岐で扱うと保守不能になる。**
+したがって Adapter は「コードの集合」ではなく **「宣言的記述 + 有限個のプリミティブ」** として設計する。
+
+### 9.2 Model Spec (宣言的記述)
+
+```toml
+# specs/qwen3_6_moe.toml   — アーキテクチャファミリの記述 (モデル個体ではない)
+[spec]
+family        = "qwen3.6-moe"
+spec_version  = 1
+gguf_arch     = "qwen3next"          # GGUF general.architecture との対応
+min_runtime   = "0.1.0"
+
+# ── 層プランの生成規則 ────────────────────────────────────
+# 具体的な層数・experts 数は GGUF/HF config から読む。ここは「規則」だけ。
+[layer_plan]
+kind    = "cyclic"                    # cyclic | uniform | prefix_dense | explicit
+cycle   = ["linear_attn", "linear_attn", "linear_attn", "full_attn"]
+# 全層が MoE (dense_prefix = 0)
+moe_layers = "all"
+
+[mixer.full_attn]
+primitive     = "gqa"
+rope          = "yarn"
+qk_norm       = "rms"
+kv_layout     = "paged_gqa"
+
+[mixer.linear_attn]
+primitive     = "gated_delta_net"
+state_layout  = "recurrent_matrix"    # [n_v_head, k_dim, v_dim] の固定サイズ状態
+conv          = { kernel = 4 }
+# KV cache を持たない → KV Manager へのヒント
+kv_layout     = "none"
+
+# ── MoE の記述 ─────────────────────────────────────────
+[moe]
+router_activation = "sigmoid"
+router_bias       = false             # DeepSeek-V3 の aux-loss-free bias は true
+norm_topk_prob    = true
+grouping          = "none"            # deepseek なら { kind="group_limited", n_group=8, topk_group=4 }
+shared_experts    = 1
+expert_ffn        = "swiglu"          # gate/up/down
+combine           = "weighted_sum"    # 順序独立であることの宣言 (§11.5 の前提)
+
+# ── ストリーミングのためのテンソル分類 ────────────────────
+# これが MoEStream 固有の最重要セクション。
+[residency]
+resident   = ["attn.*", "linear_attn.*", "*_norm", "router.*", "shared_expert.*", "output.weight"]
+streamed   = ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"]
+row_lookup = ["token_embd.weight"]    # 行単位ランダムアクセス (常駐しない) — §17.4
+
+[expert_object]
+# 1 Expert = 何をまとめた単位か
+members = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+# GGUF 上の 3D テンソル [n_embd, n_ff_exp, n_expert] における expert 軸
+expert_axis = 2
+```
+
+**モデル個体の情報** (層数 40、experts 256、hidden 2048 等) は GGUF メタデータから読み取り、
+Spec は「規則」だけを持つ。これにより Qwen3.6-35B と将来の Qwen3.6-70B が同一 Spec を共有する。
+
+### 9.3 Adapter が提供するインタフェース (概念)
+
+```mermaid
+classDiagram
+    class ModelAdapter {
+        <<interface>>
+        +layer_plan() LayerPlan
+        +moe_descriptor(layer: u16) Option~MoeDesc~
+        +tensor_ref(layer, role) TensorRef
+        +expert_locator(layer, expert) ExpertLocator
+        +kv_layout(layer) KvLayout
+        +state_layout(layer) Option~StateLayout~
+        +residency_class(name) Residency
+        +capabilities() CapabilitySet
+    }
+    class LayerPlan {
+        +n_layers: u16
+        +entries: Vec~LayerEntry~
+        +attn_layer_indices: Vec~u16~
+        +moe_layer_indices: Vec~u16~
+    }
+    class MoeDesc {
+        +n_experts: u16
+        +top_k: u8
+        +n_shared: u8
+        +router: RouterSpec
+        +grouping: GroupingSpec
+        +expert_bytes: u32
+        +combine: CombineOp
+    }
+    class ExpertLocator {
+        +file_id: u16
+        +offset: u64
+        +len: u32
+        +member_offsets: [u32; 3]
+        +precision_tier: u8
+    }
+    class CapabilitySet {
+        +has_shared_expert: bool
+        +has_group_routing: bool
+        +has_recurrent_state: bool
+        +has_mla: bool
+        +combine_is_order_free: bool
+    }
+    ModelAdapter --> LayerPlan
+    ModelAdapter --> MoeDesc
+    ModelAdapter --> ExpertLocator
+    ModelAdapter --> CapabilitySet
+```
+
+`capabilities()` は **コアが分岐してよい唯一の場所** である。
+`if model == "qwen"` は禁止だが `if caps.has_shared_expert` は許される。
+Capability は有限個 (現在 8 個) に固定し、増やすには ADR を要する。
+
+### 9.4 具体モデルへの適用例
+
+| モデル | Spec 上の表現 | コア変更 |
+|---|---|---|
+| Qwen3.6-35B-A3B | `cycle=[LA,LA,LA,FA]`, `shared=1`, `sigmoid` | なし |
+| Qwen3-30B-A3B | `kind=uniform`, `mixer=gqa`, `shared=0` | なし |
+| Mixtral-8x7B | `n_experts=8, top_k=2, softmax, shared=0` | なし |
+| DeepSeek-V3 | `prefix_dense=3`, `grouping=group_limited`, `router_bias=true`, `mixer=mla` | **MLA プリミティブの追加が必要** (1 回だけ) |
+| GLM-4.5-Air | `prefix_dense=1`, `partial_rope` | なし |
+| 未知の新 MoE | 既存プリミティブの組合せなら Spec のみ | なし |
+
+**Adapter 設計の成功基準 (FR-7)**:
+Mixtral / Qwen3 / Qwen3.6 / GLM の 4 系統が **Spec ファイルのみ** で動くこと。
+DeepSeek MLA のような真に新しい mixer プリミティブの追加時のみ、
+`core/mixer/` にプリミティブを 1 個追加する。これは想定内の拡張であり、
+**Adapter に漏れないことが重要** (MLA は KV レイアウトの問題であって MoE の問題ではない)。
+
+### 9.5 Residency 分類 — MoEStream 固有の抽象
+
+Adapter の最重要責務は、各テンソルを 4 つの **Residency クラス**に分類することである。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Classify
+    Classify --> RESIDENT: 毎ステップ全体が必要<br/>かつ小さい
+    Classify --> STREAMED: ステップごとに<br/>一部だけ必要
+    Classify --> ROW_LOOKUP: 行単位で<br/>数行だけ必要
+    Classify --> DEVICE_ONLY: GPU 常駐が<br/>強く望ましい
+
+    RESIDENT: RESIDENT<br/>attn/GDN 重み, norm, router,<br/>shared expert, lm_head<br/>≈1.05 GiB
+    STREAMED: STREAMED<br/>routed experts<br/>19.45 GiB → cache 7.65 GiB
+    ROW_LOOKUP: ROW_LOOKUP<br/>token_embd<br/>546 MiB → 0 常駐, 4 KiB/token 読出
+    DEVICE_ONLY: DEVICE_ONLY<br/>(dGPU 時) router, norm<br/>転送を毎回避けたいもの
+```
+
+**`ROW_LOOKUP` は本設計固有の工夫**である。
+Qwen3.6 は vocab 248,320 と巨大で、入力 Embedding だけで 546 MiB を占める。
+しかし 1 ステップで必要なのは高々 `batch_tokens` 行 (1 行 = 1,152 B) に過ぎない。
+これを **1 回の 4 KiB 読出**に置き換えることで、常駐 RAM を 546 MiB 削減できる。
+大語彙モデル (Gemma, Qwen, Llama-4) 全般に効く一般化された最適化である。
+
+> 出力側 `lm_head` は毎ステップ全行が必要なため RESIDENT。
+> ただし §31.5 に vocab 分割による将来最適化を記載。
+
+### 9.6 プラグイン方式の是非 (ADR-0007)
+
+**決定: v1 では動的バイナリプラグイン ABI を提供しない。**
+
+| 選択肢 | 利点 | 欠点 | 判定 |
+|---|---|---|---|
+| A. 宣言的 Spec (TOML) のみ | 安全、検証可能、コード不要、CI で全 Spec を回帰テストできる | 新プリミティブは表現不能 | ✅ **v1 採用** |
+| B. 静的レジストリ (コンパイル時登録) | 型安全、インライン化可能、デバッグ容易 | 追加に再ビルドが要る | ✅ **v1 併用** (新 mixer 用) |
+| C. 動的 C ABI プラグイン (`.so`) | 再ビルド不要、サードパーティ拡張 | ABI 安定化コスト、クラッシュ切分け困難、ホットパスに間接呼出、セキュリティ | ❌ **v1 非採用** |
+| D. WASM プラグイン | サンドボックス安全 | ホットパスに置けない性能特性 | ❌ (制御プレーンなら将来検討) |
+
+**理由**: MoE アーキの多様性は「無限」ではなく「有限個のプリミティブの組合せ」である。
+実際、上表の 6 モデルは `gqa / mla / gated_delta_net` の 3 mixer と
+`swiglu` 1 種の FFN で尽くされる。
+無限の拡張性を仮定してホットパスに間接呼出を持ち込むのは、
+**存在しない要求のために PR-2 を犠牲にする**行為である (P6, P7)。
+
+v2 で C ABI を検討する条件を明示: 「外部コントリビュータから 3 件以上、
+静的レジストリでは解決できない拡張要求が出たとき」。
+
+### 9.7 コアへのモデル知識混入を防ぐ CI 検査
+
+```
+tests/architecture/no_model_names.rs:
+  crates/moestream-core/ 配下の全ソースを走査し、
+  "qwen" | "deepseek" | "mixtral" | "glm" | "llama" 等の
+  モデル名文字列が現れたらビルド失敗させる。
+  (crates/moestream-spec/ と tests/ は除外)
+```
+
+これは P7 を機械的に強制する。設計文書の規範をレビュアの善意に頼らない。
+
+---
+
+## 10. Runtime Core 設計
+
+### 10.1 実行単位の階層
+
+```
+Request      : ユーザからの 1 生成要求 (prompt + sampling params)
+  └─ Sequence : 1 つの自己回帰列 (spec decode では draft/target で複数)
+       └─ Step : スケジューラが 1 回の forward として実行する単位
+            └─ LayerStep : 1 層分の実行
+                 └─ ExpertTask : 1 (層, expert) に対する GEMM
+```
+
+### 10.2 Step の構造
+
+1 Step は複数セッションのトークンを束ねた「連続バッチ」である。
+
+```mermaid
+graph LR
+    subgraph Step["Step (バッチ = 6 tokens)"]
+        T1["s1: decode 1 tok"]
+        T2["s2: decode 1 tok"]
+        T3["s3: prefill chunk 3 tok"]
+        T4["s4: decode 1 tok"]
+    end
+    Step --> LS0["LayerStep 0"] --> LS1["LayerStep 1"] --> LSN["... LayerStep 39"] --> HEAD["lm_head + sample"]
+```
+
+**Chunked prefill の統合**: prefill と decode を同一 Step に混ぜる (vLLM/SGLang と同様)。
+ただし MoEStream には固有の制約がある —
+**prefill チャンクは Expert の union を急激に広げる** (§2.4 の `d(B)`)。
+そのため Scheduler は「prefill チャンクサイズ」を **I/O 予算から逆算**する (§16.4)。
+
+### 10.3 LayerStep の実行フェーズ
+
+```mermaid
+stateDiagram-v2
+    [*] --> Mixer
+    Mixer: ① Mixer (GQA or GDN)<br/>KV/state 更新
+    Mixer --> Router
+    Router: ② Router GEMM (常駐, 極小)<br/>→ top-k expert ids + weights
+    Router --> Notify
+    Notify: ③ Prefetch Engine へ<br/>確定 ID を通知 (P0 予測器)
+    Notify --> Shared
+    Shared: ④ Shared Expert 実行<br/>(常駐, 待ちなし)
+    Shared --> Gather
+    Gather: ⑤ Slot 解決 + refcount 取得<br/>hit / miss 判定
+    Gather --> Wait
+    Wait: ⑥ 到着順ディスパッチループ<br/>(§11.5)
+    Wait --> Accum
+    Accum: ⑦ 重み付き累積<br/>(順序独立)
+    Accum --> Release
+    Release: ⑧ refcount 解放<br/>統計更新
+    Release --> [*]
+```
+
+**③ の位置が重要**: Router 結果が出た瞬間に(Expert 実行を待たずに)
+Prefetch Engine へ通知する。これにより **④ Shared Expert の計算時間 (約 0.1 ms)** すら
+I/O の秘匿に使える。細かいが、40 層 × 全ステップで効く。
+
+### 10.4 Graph Builder と ID Remap
+
+GGML の MoE カーネル `ggml_mul_mat_id(as, b, ids)` は
+`as` = 全 Expert を束ねた 3D テンソル、`ids` = expert index を取る。
+
+MoEStream では `as` を **「キャッシュスロット表」** に差し替える:
+
+```
+  通常 (llama.cpp):
+    as   = ffn_gate_exps  [2048, 512, 256]   ← 全 256 expert が連続で常駐
+    ids  = [37, 91, 12, ...]                 ← expert_id
+
+  MoEStream:
+    as   = gate_slab      [2048, 512, S]     ← S = キャッシュスロット数 (例 4027)
+    ids  = [1804, 22, 3311, ...]             ← slot_id (= Slot Table による写像)
+```
+
+**この 1 段の間接参照だけで、GGML のカーネルを 1 行も変更せずに
+動的キャッシュの上で MoE を実行できる。** (P6 の具体化)
+
+```mermaid
+graph LR
+    R["Router 出力<br/>expert_ids [8]"] --> M{"Slot Table<br/>(layer,expert) → slot"}
+    M -->|hit| S["slot_ids [8]"]
+    M -->|miss| F["Fetch 要求"] --> W["到着待ち"] --> S
+    S --> G["ggml_mul_mat_id(slab, x, slot_ids)<br/>★無改造カーネル"]
+```
+
+**制約**: slab は全スロットが同一 shape・同一量子化型でなければならない。
+これが §18.6 の「精度 tier ごとに別 slab を持つ」設計を要求する。
+
+### 10.5 グラフ再構築コストの管理
+
+GGML グラフを毎ステップ再構築すると、40 層 × 数十ノードの構築コスト (数百 µs) が
+1 ms/層 の予算に対して無視できない。
+
+**対策 (3 段構え)**:
+1. **グラフテンプレートのキャッシュ**: バッチ形状 (トークン数) ごとにグラフ骨格を再利用し、
+   `ids` テンソルと入出力ポインタのみ書き換える。
+2. **形状のバケット化**: バッチサイズを `{1,2,4,8,16,32,64,128,256,512}` に丸め、
+   グラフ再構築を高々 10 種に抑える (パディング分は無駄になるが構築コストより安い)。
+3. **CUDA Graph / Vulkan の事前記録コマンドバッファ** (v1.1): 形状固定の decode パスで
+   コマンド再記録を排除。
+
+### 10.6 決定論の保証 (QR-1)
+
+| 潜在的な非決定要因 | 対策 |
+|---|---|
+| Expert を到着順に累積 → 浮動小数の加算順序が変わる | **累積は必ず論理 expert 順に行う**。到着順に GEMM を「発行」するが、結果は `expert_rank` 別のバッファへ書き、最後に固定順で reduce。GEMM 自体は独立なので順序自由 |
+| キャッシュ状態によって計算内容が変わる | `strict` モードでは変わらない (待つだけ)。`soft`/`turbo` のみ変わり、その旨をヘッダで通知 |
+| バッチ構成が変わると GEMM の分割が変わる | GGML の `mul_mat_id` は行ごとに独立。バッチ内他トークンの影響を受けない |
+| スレッド数による reduce 順序 | GGML の設定を baseline と揃える。CI で固定 |
+
+> 到着順発行 + 固定順 reduce により、**性能上の順序自由と数値上の決定論を両立する**。
+> 追加コストは `top_k × hidden × 4 B = 8 × 2048 × 4 = 64 KiB` の一時バッファのみ。
+
+---
+
+## 11. Expert Manager 設計
+
+### 11.1 Expert オブジェクトの定義
+
+```
+ExpertKey  = (layer_id: u16, expert_id: u16)     → u32 に packing
+ExpertId   = layer_id * n_experts + expert_id    → 0 .. 10,239 の密な ID
+```
+
+密 ID にすることで、全統計を **配列** で持てる (ハッシュ不要、キャッシュフレンドリ)。
+これが §2.5 で述べた「10,240 個だからできる」設計の中核である。
+
+| データ | サイズ | 用途 |
+|---|---|---|
+| `state: AtomicU8` × 10,240 | 10 KiB | 状態機械 |
+| `slot: AtomicU16` × 10,240 | 20 KiB | Slot Table |
+| `refcount: AtomicU16` × 10,240 | 20 KiB | 使用中保護 |
+| `freq_ema: f32` × 10,240 | 40 KiB | 厳密頻度統計 |
+| `last_used: u32` × 10,240 | 40 KiB | 再利用距離 |
+| `weight_mass: f32` × 10,240 | 40 KiB | ルータ重み累積 |
+| **合計** | **≈170 KiB** | **L2 キャッシュに収まる** |
+
+### 11.2 Expert 状態機械
+
+```mermaid
+stateDiagram-v2
+    [*] --> EVICTED
+
+    EVICTED --> QUEUED: prefetch 要求<br/>(優先度付き)
+    EVICTED --> QUEUED_URGENT: demand fetch<br/>(実行が待っている)
+
+    QUEUED --> IN_FLIGHT: SQE 発行<br/>(slot 確保済)
+    QUEUED_URGENT --> IN_FLIGHT: SQE 発行 (先頭挿入)
+    QUEUED --> EVICTED: キャンセル<br/>(予測が陳腐化)
+
+    IN_FLIGHT --> RESIDENT_HOST: CQE 完了
+    IN_FLIGHT --> FAILED: I/O エラー
+    IN_FLIGHT --> EVICTED: キャンセル成功<br/>(IORING_OP_ASYNC_CANCEL)
+
+    RESIDENT_HOST --> UPLOADING: dGPU: VRAM tier へ昇格
+    UPLOADING --> RESIDENT_DEVICE: 転送完了
+    RESIDENT_DEVICE --> RESIDENT_HOST: VRAM から降格
+
+    RESIDENT_HOST --> EVICTING: eviction 選定<br/>(refcount==0 必須)
+    RESIDENT_DEVICE --> EVICTING: 同上
+    EVICTING --> EVICTED: slot 解放
+
+    RESIDENT_HOST --> PINNED: hot set 昇格
+    PINNED --> RESIDENT_HOST: pin 解除
+
+    FAILED --> EVICTED: リトライ後
+    FAILED --> POISONED: 恒久エラー<br/>(checksum 不一致等)
+
+    note right of RESIDENT_HOST
+        UMA 環境では
+        RESIDENT_HOST == RESIDENT_DEVICE
+        (§14.4 zero-copy)
+    end note
+```
+
+**refcount の規律**: `RESIDENT_*` かつ `refcount > 0` の Expert は絶対に evict されない。
+`refcount` は Graph Builder が `ids` を確定した時点で取得し、
+GGML グラフの実行完了 (fence/semaphore) 後に解放する。
+
+### 11.3 Slot Table と Slab
+
+```
+Host Arena (HugePages, 2 MiB pages)
+┌─────────────────────────────────────────────────────────────┐
+│ gate_slab : S × 576 KiB   = 2,264 MiB  (S=4027)             │
+│ up_slab   : S × 576 KiB   = 2,264 MiB                       │
+│ down_slab : S × 840 KiB   = 3,303 MiB                       │
+└─────────────────────────────────────────────────────────────┘
+                     合計 7,831 MiB ≈ 7.65 GiB
+
+slot i の 3 メンバは、それぞれの slab の同一 index に置かれる。
+ → GGML から見ると 3 本の独立した 3D テンソル。無改造で mul_mat_id が使える。
+ → SSD 上では 1 Expert = 連続 1,992 KiB なので、
+    1 回の readv (iovec 3 本) で 3 slab へ直接 DMA scatter できる。 (§13.4)
+```
+
+```mermaid
+graph TB
+    subgraph DISK[".msp on NVMe (連続 1,992 KiB / expert)"]
+        D1["gate 576 KiB"]
+        D2["up 576 KiB"]
+        D3["down 840 KiB"]
+    end
+    subgraph RAM["Host Arena (3 slab, slot i)"]
+        R1["gate_slab[i]"]
+        R2["up_slab[i]"]
+        R3["down_slab[i]"]
+    end
+    D1 -->|"iovec[0]"| R1
+    D2 -->|"iovec[1]"| R2
+    D3 -->|"iovec[2]"| R3
+    DISK -.->|"1 回の IORING_OP_READV<br/>O_DIRECT / zero-copy"| RAM
+```
+
+**これが `.msp` 形式を導入する最大の理由**である。
+GGUF では gate/up/down が別テンソルとして遠隔地にあり、
+1 Expert に **3 回の独立 I/O** が必要になる。IOPS が 3 倍、
+かつ 4 KiB 境界が保証されないため O_DIRECT が使えない (§13.6)。
+
+### 11.4 スロット割当ポリシー
+
+```
+確保:  free_list から pop  →  空なら Cache Manager に eviction を要求
+      →  evict 不能 (全て refcount>0 or PINNED) なら:
+           demand: 実行スレッドをブロック (稀。設計上のアラート)
+           prefetch: 要求を破棄 (優先度が低いので当然)
+```
+
+**フラグメンテーションが起きない**: 全スロットが同一サイズなので、
+free list 方式で断片化ゼロ。これも「Expert 単位の固定粒度」の副次的利点。
+(精度 tier を導入する場合は tier ごとに独立した slab と free list を持つ。)
+
+### 11.5 到着順ディスパッチ (Out-of-Order Expert Execution) ★
+
+**本設計の中核的アイデア。** MoE の FFN 出力は
+
+```
+y = Σ_{i ∈ topk(x)} w_i · Expert_i(x)
+```
+
+であり、**和は可換**である。したがって Expert を expert_id 順に処理する必要は一切ない。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant EX as 実行スレッド
+    participant EM as Expert Manager
+    participant IO as Storage Backend
+
+    Note over EX: 層 L: top-8 = {12,37,91,104,150,201,233,240}
+    EX->>EM: acquire(層L, ids[8])
+    EM-->>EX: hit: {12,91,201,240} (slot 済)<br/>miss: {37,104,150,233}
+    EM->>IO: 4 件の urgent readv 発行
+
+    Note over EX: ★ ここで待たない
+    EX->>EX: GEMM(12) 実行 → accum[rank of 12]
+    EX->>EX: GEMM(91) 実行 → accum[rank of 91]
+    IO-->>EM: CQE: 150 完了
+    EM-->>EX: ready(150)
+    EX->>EX: GEMM(150) 実行
+    EX->>EX: GEMM(201), GEMM(240)
+    IO-->>EM: CQE: 37, 233 完了
+    EM-->>EX: ready(37,233)
+    EX->>EX: GEMM(37), GEMM(233)
+    IO-->>EM: CQE: 104 完了 (最も遅い)
+    EM-->>EX: ready(104)
+    EX->>EX: GEMM(104)
+    EX->>EX: reduce(accum[0..8]) ← ★論理 rank 順で固定
+    Note over EX: 総所要 = max(計算合計, 最遅 I/O)<br/>ではなく両者の重なり
+```
+
+**得られる効果**:
+- Head-of-line blocking の完全な除去。expert 37 が遅くても 91 の計算は進む。
+- I/O のジッタ (NVMe のテールレイテンシは平均の 10 倍になり得る) が
+  他 Expert の計算時間で吸収される。
+- PR-5 (p99/median ≤ 2.0) の主要な達成手段。
+
+**実装上の要点**:
+- 完了通知は lock-free MPSC リング (CQE 処理スレッド → 実行スレッド)。
+- 実行スレッドは「全 hit を先に消化 → 残りを完了順に消化」というシンプルなループ。
+- `accum` は `top_k` 個の独立バッファ (64 KiB) で、最後に固定順 reduce (§10.6)。
+
+**適用可能性の宣言**: この最適化は `MoeDesc.combine == weighted_sum` のときのみ有効。
+Adapter の `capabilities().combine_is_order_free` で守る。
+(将来、順序依存の combine を持つアーキが出た場合に安全に無効化できる。)
+
+### 11.6 デマンドフェッチと品質モード
+
+miss した Expert への対処は、品質モードとルータ重みで決まる。
+
+| モード | 挙動 | 品質保証 |
+|---|---|---|
+| `strict` (既定) | 全 miss を必ず待つ | bit-exact (QR-1) |
+| `soft` | ルータ重み `w_i < τ_soft` (既定 0.02) かつ デッドライン超過時のみスキップ、残りを再正規化 | PPL 劣化 ≤ 1% (QR-2) |
+| `turbo` | `w_i < τ_turbo` (既定 0.06) でスキップ + 低精度 tier からの代替読出を許可 | PPL 劣化 ≤ 3% (QR-3) |
+
+**ルータ重み閾値がなぜ有効か**: top-8 の重み分布は強く歪んでおり、
+下位 2〜3 個の重みは合計しても数 % に満たないことが多い。
+かつ Qwen3.6 には **Shared Expert が常に寄与している** ため、
+routed expert の一部欠落に対する頑健性が構造的に高い。
+
+```
+スキップ時の再正規化:  y = ( Σ_{i∈kept} w_i·E_i(x) ) / ( Σ_{i∈kept} w_i )  + shared(x)
+```
+
+**重要**: スキップは「miss かつデッドライン超過」の両方が成立した場合のみ。
+キャッシュが温まった定常状態ではほぼ発生せず、
+発生率を `moestream_expert_skipped_total` で必ず公開する (P9)。
+
+### 11.7 Shared Expert の扱い
+
+Qwen3.6 / DeepSeek / GLM の Shared Expert は **毎トークン必ず使われる**。
+40 層 × 1.945 MiB = 76 MiB に過ぎないため、**無条件で PINNED**。
+Adapter の `capabilities().has_shared_expert` で分岐する数少ない箇所。
+
+これは品質面でも重要で、§11.6 のスキップが許容できる根拠になっている。
+
+---
+
+## 12. Cache Manager 設計
+
+### 12.1 キャッシュ階層
+
+```mermaid
+graph TB
+    subgraph T0["Tier 0: VRAM (dGPU のみ)"]
+        V["ホット Expert の複製<br/>容量: VRAM 余剰分<br/>UMA では存在しない"]
+    end
+    subgraph T1["Tier 1: Host Arena (主戦場)"]
+        P["PINNED セグメント<br/>(オフライン統計 hot set)"]
+        DY["DYNAMIC セグメント<br/>(S3-FIFO + ゴースト)"]
+    end
+    subgraph T2["Tier 2: OS Page Cache"]
+        PC["★意図的に使わない<br/>O_DIRECT でバイパス"]
+    end
+    subgraph T3["Tier 3: NVMe"]
+        N[".msp 本体<br/>19.45 GiB"]
+    end
+    V -.降格.-> T1
+    T1 -.昇格.-> V
+    T1 -->|miss| N
+    N -->|readv| T1
+    style PC fill:#742a2a,color:#fff
+    style DY fill:#2b6cb0,color:#fff
+```
+
+### 12.2 なぜプレーン LRU ではないか
+
+| ポリシー | Expert ワークロードでの問題 |
+|---|---|
+| LRU | prefill の全 Expert スイープ (§20.2) が **キャッシュ全体を 1 回で汚染**する。スキャン耐性ゼロ |
+| LFU (純粋) | セッションが話題を変えたときに追従できない (エイジングなし) |
+| ARC | 適応的だが実装が重く、10,240 個という小さな空間では過剰 |
+| **W-TinyLFU** | スキャン耐性 + 頻度考慮。**採用の基礎** |
+| **S3-FIFO** | 2024 以降の実測で LRU/ARC を上回る。実装が単純で lock 競合が小さい |
+
+### 12.3 採用ポリシー: 3 セグメント構成
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Expert Cache (S スロット)                                     │
+│                                                              │
+│  ┌──────────────┐ ┌──────────────────────────────────────┐  │
+│  │ PINNED       │ │ DYNAMIC (S3-FIFO)                    │  │
+│  │ α·S (既定 20%)│ │ (1−α)·S                              │  │
+│  │              │ │ ┌────────┐ ┌──────────────────────┐ │  │
+│  │ オフライン    │ │ │ SMALL  │ │ MAIN                 │ │  │
+│  │ 統計による    │ │ │ (10%)  │ │ (90%)                │ │  │
+│  │ 全域ホットセット│ │ │ 新規流入│ │ 2 回目以降に昇格した  │ │  │
+│  │              │ │ └───┬────┘ └──────────────────────┘ │  │
+│  │ evict 不可    │ │     │  freq≥1 で昇格                │  │
+│  └──────────────┘ │     ▼                               │  │
+│                   │  ┌────────────────────────────────┐ │  │
+│                   │  │ GHOST (メタデータのみ, 実体なし) │ │  │
+│                   │  │ 追い出した ID を記録 → 再参照で   │ │  │
+│                   │  │ MAIN へ直接昇格 + 層別クォータ調整│ │  │
+│                   │  └────────────────────────────────┘ │  │
+│                   └──────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**S3-FIFO を選ぶ理由**:
+- 「1 回しか使われないオブジェクト」を SMALL キューで素早く排除する →
+  prefill スイープや誤った投機プリフェッチによる汚染に強い。
+- FIFO ベースなのでロック競合が LRU より小さい (リスト再結合が不要)。
+- ゴーストキューが「もう少しキャッシュがあれば当たったか」を教えてくれる → §12.5 に使う。
+
+### 12.4 Admission ポリシー
+
+「読んだものを必ずキャッシュに入れる」は誤りである。
+
+| 流入元 | Admission 判定 |
+|---|---|
+| デマンドフェッチ (実行が待った) | **必ず admit** (SMALL へ)。実際に必要だった証拠がある |
+| 高確度プリフェッチ (P0/P1) | admit (SMALL へ) |
+| 低確度プリフェッチ (P2/P3 の下位) | **admit するが SMALL の末尾**。外れた場合すぐ排除される |
+| prefill スイープ (§20.2) | **admit しない** (バイパス読出)。ただし統計は記録し、後で hot set 再構成に使う |
+
+**prefill スイープを admit しないのが決定的に重要。**
+2K トークンの prefill は全 10,240 Expert に触れるため、
+素直に admit すると decode 用に温めたキャッシュが全損する。
+
+### 12.5 層別クォータの動的調整
+
+全層に均等にスロットを配るのは最適ではない。層によってルーティングの
+集中度 (エントロピー) が異なり、キャッシュの限界効用が違う。
+
+**手法: ゴーストリストによる限界ヒット率の推定**
+
+```
+各層 L について:
+  ghost_hits[L] = 「ゴーストに居た ID が再参照された回数」
+                = 「その層にあと少しスロットを与えれば増えたヒット数」の推定量
+
+定期的 (例: 512 step ごと) に:
+  quota[L] ← quota[L] + η · ( ghost_hits[L] − mean(ghost_hits) )
+  制約: Σ quota[L] = S_dynamic,  quota[L] ≥ quota_min
+```
+
+これは Miss Ratio Curve の勾配を、追加コストほぼゼロで
+オンライン推定していることに相当する (ARC の適応機構を層次元へ拡張したもの)。
+
+```mermaid
+graph LR
+    A["層 L のゴースト<br/>ヒット数"] --> B{"平均より多い?"}
+    B -->|Yes| C["quota[L] を増やす<br/>= その層は<br/>キャッシュが効く"]
+    B -->|No| D["quota[L] を減らす<br/>= その層は<br/>ルーティングが分散"]
+    C --> E["Σquota = S を維持<br/>(正規化)"]
+    D --> E
+```
+
+> **仮説と検証**: 一般に浅い層ほどルーティングが分散し、深い層ほど専門化すると
+> 報告されている。もしそうなら quota は深い層に厚く配分されるはずである。
+> この予測は §33 のベンチマークで検証し、結果を `docs/findings/` に公開する (P8)。
+
+### 12.6 PINNED セット (hot set) の構成
+
+`moestream pack --calibrate` が較正コーパスを流して
+全 Expert の活性化頻度を測定し、`.msp` のメタデータに格納する。
+
+**重要な注意点**: Qwen3.6 の学習には expert 負荷分散の補助損失
+(係数 0.001) が入っており、**全 256 expert がバッチ横断でほぼ均等に使われる**よう
+明示的に訓練されている。したがって:
+
+> **グローバル頻度の歪みは弱い可能性が高い。
+> 一方、シーケンス単位・ドメイン単位の歪みは強いと期待される。**
+
+これは MoE-Infinity 系の観測と整合する。したがって:
+
+| 設定 | 既定 | 根拠 |
+|---|---|---|
+| PINNED 比率 α | **0.20** | 較正で歪みが弱ければ小さく、強ければ大きくする。実測で決める |
+| `--pin-strategy` | `auto` | `global` (全域統計) / `domain:<name>` (コーディング用等) / `off` |
+| ドメイン別 hot set | 提供する | コード用・日本語用など複数の hot set を `.msp` に同梱し、起動時に選択 |
+
+**この不確実性は設計の弱点ではなく、測定計画の対象である。**
+§33.4 に「Expert 活性化分布の測定」を第一級のベンチマーク項目として置く。
+測定結果次第で α のデフォルトを変えるが、**アーキテクチャは変わらない**
+(PINNED 比率はパラメータであって構造ではない)。
+
+### 12.7 KV Cache との共存 — Memory Governor
+
+Expert Cache と KV は同一の RAM 予算を奪い合う。調停は Memory Governor が行う。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Balanced
+    Balanced --> KvPressure: 新規セッション or<br/>context 伸長で KV 需要増
+    KvPressure --> ShrinkExpert: Expert Cache を縮小<br/>(DYNAMIC の MAIN 末尾から)
+    ShrinkExpert --> Balanced: KV 確保成功
+    ShrinkExpert --> KvSwap: Expert Cache が<br/>下限 S_min に到達
+    KvSwap: 最も idle なセッションの<br/>KV/state を SSD へ退避 (§26.5)
+    KvSwap --> Balanced
+    KvSwap --> Reject: 退避しても不足
+    Reject: 新規リクエストを 503<br/>(既存セッションは守る)
+    Reject --> Balanced: セッション終了で回復
+    Balanced --> GrowExpert: KV 需要減<br/>(セッション終了)
+    GrowExpert --> Balanced
+```
+
+**方針: KV が Expert Cache に優先する。**
+理由: KV を失うとセッションが壊れる (再計算に prefill 相当のコストが要る) が、
+Expert Cache を失っても遅くなるだけである。回復不能性の非対称性に従う。
+
+**下限 `S_min`**: Expert Cache には下限を設ける (既定: 全 Expert の 5% = 512 slot ≈ 1 GiB)。
+これを割るとストール率が跳ね上がり、KV を守った意味がなくなるため、
+`S_min` 到達時点で新規セッションの受入を止める (admission control, §16.5)。
+
+### 12.8 マルチセッションでのキャッシュ共有効果
+
+```mermaid
+graph TB
+    S1["Session 1<br/>コード生成"] --> U["Expert 活性化の和集合"]
+    S2["Session 2<br/>コードレビュー"] --> U
+    S3["Session 3<br/>日本語要約"] --> U
+    U --> C["共有 Expert Cache"]
+    C --> R1["S1,S2 は Expert 分布が近い<br/>→ 相互にキャッシュを温める"]
+    C --> R2["S3 は分布が異なる<br/>→ 干渉が起きうる"]
+    R2 --> AF["対策: Expert-Affinity Batching<br/>(§26.4)"]
+```
+
+同種タスクの Agent が複数走る場合、共有キャッシュは**単純に得**である。
+異種タスクが混ざる場合は干渉 (cache thrashing) が起きうるため、
+§26.4 で「Expert プロファイルが近いセッションを優先的に同一バッチへ束ねる」
+スケジューリングを導入する。
+
+---
+
+## 13. Storage Backend 設計
+
+### 13.1 抽象インタフェース
+
+```mermaid
+classDiagram
+    class StorageBackend {
+        <<interface>>
+        +open(path, flags) FileHandle
+        +register_buffers(arena: &[IoRegion]) RegHandle
+        +submit(reqs: &[ReadReq]) SubmitResult
+        +poll_completions(out: &mut [Completion], max) usize
+        +cancel(req_id) bool
+        +capabilities() StorageCaps
+    }
+    class ReadReq {
+        +req_id: u64
+        +file_id: u16
+        +offset: u64
+        +iov: SmallVec~IoSlice, 3~
+        +priority: Priority
+        +deadline: Option~Instant~
+    }
+    class StorageCaps {
+        +supports_direct_io: bool
+        +supports_vectored: bool
+        +supports_cancel: bool
+        +supports_priority: bool
+        +alignment: u32
+        +max_queue_depth: u32
+        +measured_bw: f64
+    }
+    StorageBackend <|.. IoUringBackend
+    StorageBackend <|.. PreadPoolBackend
+    StorageBackend <|.. MmapBackend
+    StorageBackend --> ReadReq
+    StorageBackend --> StorageCaps
+```
+
+インタフェースは **完全非同期・提出/完了分離** で設計する。
+同期 API を持たないことで、mmap バックエンドですら
+「別スレッドで touch して完了通知」という形に強制され、
+上位層のコードが I/O 方式によって分岐しないことを保証する。
+
+### 13.2 mmap を主機構にしない理由 (ADR-0004)
+
+これは本設計で最も議論を呼ぶ判断であるため、詳細に根拠を述べる。
+
+| 論点 | mmap + page cache | io_uring + O_DIRECT + 自前キャッシュ |
+|---|---|---|
+| **RAM 上限の保証** | ❌ **不可能**。page cache は「使えるだけ使う」。cgroup で制限すると今度は予測不能に落とされる | ✅ 確保した arena が全て。FR-4 を満たせる |
+| どの Expert が載っているかの把握 | ❌ `mincore(2)` で推測するのみ。カーネルの判断は不可視 | ✅ 完全に把握。P8 の観測性が成立 |
+| Eviction ポリシーの制御 | ❌ カーネルの LRU 近似に従うのみ。prefill スイープでホットセットが飛ぶ | ✅ S3-FIFO / PINNED を自由に実装 |
+| 非同期性 | ❌ ページフォルトは**同期的にスレッドを止める**。P3 に真っ向から反する | ✅ 完全非同期 |
+| 読出粒度 | ❌ 4 KiB ページ単位。`MADV_WILLNEED` は best-effort でキャンセル不可 | ✅ 1,992 KiB を 1 回で、キャンセル可 |
+| メモリコピー | ✅ ゼロコピー (page cache が直接見える) | ✅ ゼロコピー (DMA が arena へ直接) |
+| 実装の簡潔さ | ✅ 圧倒的に簡単 | ❌ 複雑 |
+| プロセス間共有 | ✅ 複数プロセスで page cache 共有 | ❌ 不可 (ただし §10 のデーモンモデルで代替) |
+| 移植性 | ✅ どこでも動く | ❌ Linux 5.15+ 限定 |
+
+**結論**: mmap の唯一の本質的優位は「プロセス間共有」だが、
+MoEStream は **P10 (1 プロセス、多 Agent)** によりこれを不要にしている。
+一方 FR-4 (RAM 上限) と P3 (非ブロッキング) は mmap では原理的に満たせない。
+
+**ただし mmap バックエンドは以下の用途で維持する**:
+- 開発・デバッグ用の参照実装 (最も単純で、正しさの基準になる)
+- io_uring 非対応環境 (古いカーネル、macOS、WSL1)
+- **常駐テンソル (RESIDENT クラス) の初回ロード** — これは 1 回きりなので mmap で十分
+
+### 13.3 io_uring バックエンドの構成
+
+```mermaid
+graph LR
+    subgraph APP["MoEStream プロセス"]
+        PF["Prefetch Engine"] -->|"優先度付き<br/>ReadReq"| SUB["Submitter<br/>(バッチ提出)"]
+        SUB --> SQ["SQ Ring"]
+        CQ["CQ Ring"] --> COMP["Completion Reaper"]
+        COMP -->|"lock-free MPSC"| EM["Expert Manager"]
+    end
+    SQ -.->|"io_uring_enter<br/>(または SQPOLL)"| K["Kernel"]
+    K -.-> CQ
+    K --> NVME[("NVMe")]
+    NVME -->|"DMA 直接書込<br/>(O_DIRECT, registered buf)"| ARENA["Host Arena<br/>(HugePages, 固定登録)"]
+```
+
+**設定 (Linux 6.1+ を想定)**:
+
+| 設定 | 値 | 理由 |
+|---|---|---|
+| `IORING_SETUP_SQPOLL` | 条件付き有効 | syscall を排除できるが専有コアを 1 本食う。コア数 ≥ 8 かつ `--io-sqpoll` 指定時のみ |
+| `IORING_SETUP_SINGLE_ISSUER` | 有効 | 提出スレッドを 1 本に限定し、カーネル側のロックを削減 |
+| `IORING_SETUP_DEFER_TASKRUN` | 有効 | 完了処理を `io_uring_enter` 時にまとめる。CPU 効率が上がる |
+| `IORING_SETUP_COOP_TASKRUN` | 有効 | IPI を削減 |
+| `IORING_REGISTER_BUFFERS` | 必須 | arena 全体を固定登録し、提出ごとの `get_user_pages` を排除。**これがゼロコピーの前提** |
+| `IORING_REGISTER_FILES` | 有効 | fd の参照カウント操作を排除 |
+| Queue Depth | 128 | §13.5 で算出 |
+| `O_DIRECT` | 有効 (可能なら) | page cache を完全バイパス。二重バッファリングを排除し FR-4 を守る |
+
+### 13.4 ベクタ読出による 3-slab 同時充填
+
+```
+IORING_OP_READV, fd=msp, offset = expert_record_offset
+iov[0] = { base: gate_slab + slot*576KiB, len: 576 KiB }
+iov[1] = { base: up_slab   + slot*576KiB, len: 576 KiB }
+iov[2] = { base: down_slab + slot*840KiB, len: 840 KiB }
+                                            ─────────
+                                    合計 1,992 KiB = 498 × 4 KiB  ✅ アライン済
+```
+
+- 1 Expert = **1 SQE**。IOPS を 3 分の 1 に削減。
+- 各セグメントが 4 KiB 境界・4 KiB 倍長 → **O_DIRECT の制約を満たす**。
+- カーネルが 1 回の連続読出として NVMe へ発行できる (最大帯域)。
+
+> Q4_K の 1 行 = 2048 weights = 8 superblock × 144 B = 1,152 B。
+> 512 行 × 1,152 B = 589,824 B = 576 KiB ちょうど。偶然だが好都合。
+> **一般には `.msp` の pack 時に各メンバを 4 KiB 境界へパディングする** ことで常に成立させる。
+
+### 13.5 Queue Depth と in-flight バイト数の設計
+
+必要な in-flight バイト数は「プリフェッチ先読み時間 × 帯域」で決まる。
+
+```
+t_layer      = t_c / L = 40 ms / 40 = 1.0 ms
+先読み深度 D  = 4 層 (§22.7 で決定)
+在庫時間      = D × t_layer = 4 ms
+必要 in-flight = BW × 在庫時間 = 6 GB/s × 4 ms = 24 MB
+QD (件数)     = 24 MB / 1.992 MiB ≈ 12
+
+安全率とバースト対応で QD = 64、リング容量 = 128 とする。
+```
+
+> **実測による修正 (2026-08-02, Finding S1)**
+> 上の QD=64 は誤りだった。Crucial P310 (PCIe4, DRAM-less/HMB) 実機で
+> O_DIRECT ランダム読出 (約 0.5 MiB) の帯域を測ったところ:
+>
+> | 並列度 | 帯域 |
+> |---:|---:|
+> | QD=1 | 1.55 GB/s |
+> | QD=2 | 2.85 GB/s |
+> | QD=4 | 4.28 GB/s |
+> | **QD=8** | **4.42 GB/s ← 飽和** |
+> | QD=16 | 4.20 GB/s |
+> | QD=32 | 4.46 GB/s |
+>
+> **QD=8 で飽和し、それ以上は帯域が伸びない。**
+> よって `IoGovernor` の初期値を **QD=8**、上限を **32** に改める
+> (下の「QD = 64」の記述は破棄)。
+> 適応制御という機構の設計は正しかったが、探索範囲の設定が誤っていた。
+> 詳細: `docs/findings/S1-real-expert-stream.md`
+
+**NVMe 側の考慮**: コンシューマ NVMe の最適 QD は概ね 8〜32。
+QD を過大にすると SSD 内部でキューイング遅延が増え、
+**p99 レイテンシが悪化する** (PR-5 に直撃)。
+そこで **QD 上限を適応制御**する:
+
+```
+observed_p99 > target_p99  →  in_flight_limit を減らす (AIMD 的)
+observed_bw  < target_bw   →  in_flight_limit を増やす
+```
+
+これは TCP の輻輳制御に相当する機構で、`IoGovernor` として実装する。
+
+### 13.6 GGUF 直読みモードの設計と限界
+
+| 項目 | `.msp` モード | GGUF 直読みモード |
+|---|---|---|
+| 1 Expert あたり I/O 回数 | **1** (readv) | **3** (gate/up/down が別テンソル) |
+| O_DIRECT | ✅ 使える | ❌ GGUF のテンソルアライメントは既定 32 B。4 KiB 境界を保証しない |
+| 追加コピー | なし | あり (バウンスバッファ → slab) |
+| page cache 汚染 | なし | あり (バッファード I/O のため) |
+| RAM 上限保証 | ✅ 厳密 | ⚠️ page cache 分が上振れ (`posix_fadvise(DONTNEED)` で緩和) |
+| 配置最適化 | ✅ 人気順クラスタリング | ❌ 元ファイルの順序のまま |
+| 起動時間 | 即時 | 即時 |
+| 変換の手間 | `moestream pack` (数分) | なし |
+| 想定用途 | **本番** | お試し・互換性確認 |
+
+**判断: 両方サポートする。ただし GGUF モードは明示的に "compatibility mode" と表示し、
+起動時に `.msp` への変換を促す。** 性能差は実測して起動ログに出す。
+
+### 13.7 GPUDirect Storage (GDS) の評価 (ADR-0009)
+
+**結論: v1 では採用しない。**
+
+| 観点 | 評価 |
+|---|---|
+| iGPU / UMA 環境 | ❌ **原理的に無意味**。VRAM が RAM そのものなので「GPU へ直接 DMA」に意味がない。主要ターゲットで効果ゼロ |
+| コンシューマ dGPU | ⚠️ NVIDIA cuFile はコンシューマ GPU / 一般 NVMe での対応が限定的。P2P DMA が BIOS/IOMMU 設定に依存 |
+| Vulkan | ❌ 標準的な GDS 相当機構が存在しない (`VK_EXT_external_memory_dma_buf` + p2pdma は実験的) |
+| 得られる利得 | 1.992 MiB の転送を 1 段抜くだけ。§24 の非同期転送で既に隠蔽済みなので **利得はほぼゼロ** |
+| コスト | ライブラリ依存、環境依存の障害モード、テスト困難 |
+
+**再評価の条件**: 「dGPU + 大容量 VRAM 環境向けの Tier-0 キャッシュが
+PCIe 帯域律速であることが実測で示されたとき」。それまでは §24 の
+pinned staging + 非同期コピーで十分である。
+
+---
+
+## 14. GPU Backend 設計
+
+### 14.1 戦略: 計算カーネルは書かない (P6)
+
+```mermaid
+graph TB
+    subgraph MS["MoEStream が所有するもの"]
+        A["メモリ配置と所有権"]
+        B["I/O スケジューリング"]
+        C["キャッシュポリシー"]
+        D["バッチ構成とデッドライン"]
+    end
+    subgraph GG["GGML から借りるもの"]
+        E["量子化 GEMM<br/>(Q4_K/Q6_K/IQ*)"]
+        F["mul_mat_id (MoE)"]
+        G["Attention / RoPE / RMSNorm"]
+        H["Vulkan/CUDA/ROCm/Metal/SYCL<br/>バックエンド群"]
+    end
+    MS -->|"buffer を渡す"| GG
+    GG -->|"計算結果"| MS
+    style MS fill:#2b6cb0,color:#fff
+    style GG fill:#22543d,color:#fff
+```
+
+GGML を選ぶ理由:
+- Vulkan バックエンドが成熟しており、iGPU (RADV/ANV) での実績がある → 主要ターゲットに直撃
+- Q4_K/Q6_K/IQ 系の量子化カーネルが全バックエンドで揃っている
+- `mul_mat_id` が既に存在し、**Slot Table + ID Remap (§10.4) で無改造利用できる**
+- MIT ライセンスで Apache-2.0 プロジェクトに同梱可能
+
+**リスクと対策**: GGML は llama.cpp の内部進化に追従して API が変わる。
+→ `moestream-ggml` クレートで薄いラッパを 1 枚挟み、
+バージョンを vendoring で固定。追従は四半期ごとの計画作業とする (§32.4)。
+
+### 14.2 抽象インタフェース
+
+```mermaid
+classDiagram
+    class GpuBackend {
+        <<interface>>
+        +device_info() DeviceInfo
+        +alloc_device(size, usage) DeviceBuffer
+        +import_host_ptr(ptr, size) Option~DeviceBuffer~
+        +upload_async(dst, src, stream) TransferToken
+        +is_transfer_done(token) bool
+        +submit_graph(graph, deps) SubmitToken
+        +wait(token, timeout) Result
+        +memory_type() MemoryTopology
+    }
+    class MemoryTopology {
+        <<enumeration>>
+        UNIFIED
+        DISCRETE
+        DISCRETE_RESIZABLE_BAR
+    }
+    class DeviceInfo {
+        +name: String
+        +vram_total: u64
+        +vram_free: u64
+        +supports_host_ptr_import: bool
+        +transfer_queue_count: u8
+        +measured_h2d_bw: f64
+    }
+    GpuBackend <|.. VulkanBackend
+    GpuBackend <|.. CudaBackend
+    GpuBackend <|.. RocmBackend
+    GpuBackend <|.. MetalBackend
+    GpuBackend <|.. CpuBackend
+    GpuBackend --> MemoryTopology
+    GpuBackend --> DeviceInfo
+```
+
+### 14.3 メモリトポロジによる 3 つの動作モード
+
+```mermaid
+graph TB
+    subgraph UNI["UNIFIED (iGPU / Apple / APU) — 主要ターゲット"]
+        U1["Host Arena をそのまま<br/>GPU から参照"]
+        U2["VK_EXT_external_memory_host<br/>で host ptr を import"]
+        U3["Tier 0 は存在しない<br/>コピー回数 = 0"]
+        U1 --> U2 --> U3
+    end
+    subgraph DIS["DISCRETE (dGPU, BAR 小)"]
+        D1["Host Arena (pinned)"] --> D2["staging ring"] --> D3["VRAM Tier 0"]
+        D4["Tier 0 に載らない分は<br/>毎ステップ転送"]
+    end
+    subgraph BAR["DISCRETE + Resizable BAR"]
+        B1["Host Arena"] --> B2["GPU が直接 read<br/>(BAR 経由)"]
+        B3["小さい Expert なら<br/>転送を省略可能"]
+    end
+```
+
+### 14.4 UMA におけるゼロコピー (最重要ケース)
+
+主要ターゲットである iGPU 環境では、以下により **SSD → GPU が完全ゼロコピー**になる:
+
+```
+1. Host Arena を HugePages で確保
+2. io_uring に IORING_REGISTER_BUFFERS で固定登録
+   → NVMe が DMA で arena へ直接書き込む (コピー 0)
+3. 同じ arena を VK_EXT_external_memory_host で
+   VkDeviceMemory として import
+   → GPU シェーダが arena を直接読む (コピー 0)
+
+  NVMe ──DMA──► [ Host Arena ] ◄──直接read── iGPU シェーダ
+```
+
+**制約と対策**:
+| 制約 | 対策 |
+|---|---|
+| `VK_EXT_external_memory_host` の `minImportedHostPointerAlignment` (典型 4 KiB) | HugePages 確保なので自動的に満たす |
+| 拡張が使えないドライバ | フォールバック: `HOST_VISIBLE | DEVICE_LOCAL` なヒープから arena を確保し、そこへ io_uring で書き込む (これも実質ゼロコピー) |
+| どちらも不可 | staging コピー経路へフォールバック。起動ログで警告し、期待性能を下方修正して表示 |
+
+**この 3 段フォールバックを起動時に自動判定し、`moestream doctor` で可視化する。**
+
+> **実機検証済み**: Radeon 780M (RADV PHOENIX / Mesa 25.2.8) において
+> `VK_EXT_external_memory_host` の対応を確認した。詳細は **Appendix E.2**。
+> また UMA 環境では **BIOS の UMA carve-out が Expert Cache 容量を直接圧迫する**
+> という、本章で扱っていない重要な要素がある。**Appendix E.3 を必ず参照すること。**
+
+### 14.5 dGPU における Tier 0 (VRAM) キャッシュ
+
+VRAM に余剰がある場合、ホスト arena のサブセットを VRAM に複製する。
+
+| 設計判断 | 内容 |
+|---|---|
+| ポリシー | ホスト Tier 1 とは**独立した** S3-FIFO。ただし Tier 1 の PINNED は Tier 0 でも優先 |
+| 昇格契機 | ホストでヒットした Expert のうち、`freq_ema` 上位を非同期昇格 |
+| 転送タイミング | **専用 transfer queue** で計算とオーバーラップ (§24) |
+| 一貫性 | Expert は read-only なので一貫性問題なし。降格は単に破棄 |
+| VRAM 予算 | `--vram-budget`。既定は `vram_free × 0.8 − KV割当` |
+
+### 14.6 CPU バックエンド
+
+GPU が無い/使えない環境向け。GGML の CPU バックエンド (AVX2/AVX-512/NEON) を使う。
+CPU バックエンドでは `t_c` が大きくなるため、**皮肉なことにストリーミングは楽になる**
+(隠蔽できる I/O 時間が増える)。§33 で CPU-only の測定も必ず行う。
+
+### 14.7 バックエンド選択と自動診断
+
+```
+moestream doctor
+──────────────────────────────────────────────────────────
+GPU        : AMD Radeon 780M (UNIFIED)             ✅
+Vulkan     : 1.3.280 / RADV                        ✅
+host ptr   : VK_EXT_external_memory_host           ✅ zero-copy 可能
+Storage    : /dev/nvme0n1 (Samsung 990 PRO)
+io_uring   : kernel 6.8 / SQPOLL 可 / DEFER_TASKRUN 可 ✅
+O_DIRECT   : ✅  (ext4, alignment 512)
+HugePages  : THP=madvise ✅ / explicit=0 pages ⚠️
+実測逐次帯域: 6.42 GB/s  (QD=64, 2 MiB reads)
+実測 4KiB QD1 遅延: 78 µs (p50) / 210 µs (p99)
+──────────────────────────────────────────────────────────
+推定性能   : 25.8 tok/s (baseline 推定 28.1 tok/s の 92%)
+推奨予算   : --mem-budget 10GiB  (Expert Cache 7.6 GiB / 3,920 slots)
+```
+
+`doctor` は **設計文書の理論値を、実機で検証して見せるツール**である。
+ユーザが「なぜこの性能なのか」を自力で理解できるようにすることは、
+OSS プロジェクトとしての信頼構築に直結する (P8, §35.5)。
+---
+
+## 15. Thread Model
+
+### 15.1 スレッド構成
+
+```mermaid
+graph TB
+    subgraph T["MoEStream プロセス"]
+        API["① API Threads (N=cores/4)<br/>async runtime<br/>HTTP/SSE/UDS"]
+        SCH["② Scheduler Thread (1)<br/>イベントループ<br/>バッチ構成・admission"]
+        EXE["③ Execution Thread (1)<br/>GGML グラフ提出<br/>到着順ディスパッチ"]
+        PLN["④ Prefetch Planner (1)<br/>予測器融合<br/>優先度キュー管理"]
+        SUB["⑤ IO Submitter (1)<br/>SQE 組立・提出"]
+        RPR["⑥ IO Reaper (1)<br/>CQE 回収・状態遷移"]
+        CMP["⑦ Compute Workers (M)<br/>GGML 内部 (CPU backend 時)"]
+        TEL["⑧ Telemetry (1)<br/>低優先度"]
+    end
+    API -->|"MPSC: Request"| SCH
+    SCH -->|"SPSC: Step"| EXE
+    EXE -->|"MPSC: RouterResult"| PLN
+    PLN -->|"SPSC: ReadReq batch"| SUB
+    RPR -->|"MPSC: Completion"| EXE
+    RPR -->|"MPSC: Completion"| PLN
+    EXE -->|"SPSC: StepResult"| SCH
+    SCH -->|"MPSC: Token"| API
+    EXE -.->|"ring buffer"| TEL
+    PLN -.->|"ring buffer"| TEL
+```
+
+### 15.2 スレッド責務とアフィニティ
+
+| # | スレッド | 数 | 優先度 | CPU アフィニティ | ブロックしてよいか |
+|---|---|---|---|---|---|
+| ① | API | cores/4 | 通常 | 自由 | Yes (async) |
+| ② | Scheduler | 1 | 通常 | 自由 | **No** (イベントループ) |
+| ③ | Execution | 1 | **高** | GPU/NVMe と同一 NUMA へ pin | **No** (P3) |
+| ④ | Prefetch Planner | 1 | 通常 | ③ と同一 NUMA | No |
+| ⑤ | IO Submitter | 1 | 高 | NVMe と同一 NUMA へ pin | No |
+| ⑥ | IO Reaper | 1 | **高** | NVMe と同一 NUMA へ pin | No (busy-poll 可) |
+| ⑦ | Compute Workers | 物理コア数−4 | 通常 | 分散 | (GGML 管理) |
+| ⑧ | Telemetry | 1 | **低** | 自由 | Yes |
+
+**設計判断: 実行スレッドは 1 本。**
+GPU 提出は本質的に直列であり、複数スレッドから提出するとドライバ内でロックする。
+CPU バックエンド時は GGML 内部のワーカプールが並列性を担う。
+「実行スレッドを増やす」のではなく「バッチを大きくする」ことでスループットを上げる。
+
+### 15.3 スレッド間通信
+
+| 経路 | 方式 | 理由 |
+|---|---|---|
+| ⑥ Reaper → ③ Execution | **lock-free SPSC リング** (bounded, 1024 entry) | ホットパス。1 完了あたり数十 ns でなければならない |
+| ③ Execution → ④ Planner | lock-free MPSC | Router 結果通知。低頻度 (層ごと) |
+| ④ Planner → ⑤ Submitter | SPSC リング + バッチフラグ | 複数 SQE をまとめて 1 回の `io_uring_enter` で提出 |
+| ② Scheduler ↔ 他 | crossbeam channel (bounded) | 制御プレーン。多少のコストは許容 |
+| 全 → ⑧ Telemetry | **lock-free 多重ライタリング**、溢れたら捨てる | 観測が挙動を変えてはならない (P8) |
+
+**ホットパスにミューテックスを 1 つも置かない。**
+Expert 状態は `AtomicU8` の CAS、Slot Table は `AtomicU16`、
+Cache のキュー操作のみ shard 化されたスピンロック (16 shard、
+`ExpertId % 16` で分散、競合確率は極小)。
+
+### 15.4 完了通知の busy-poll 判断
+
+| モード | 挙動 | 適用 |
+|---|---|---|
+| `eventfd` 待ち | Reaper が `io_uring_enter(GETEVENTS)` でブロック | 既定。CPU を無駄にしない |
+| busy-poll | Reaper がスピン (`IORING_SETUP_IOPOLL` 併用) | `--io-busy-poll` 指定時。p99 が数十 µs 改善するがコア 1 本を専有 |
+| SQPOLL | カーネルスレッドが SQ を監視 | `--io-sqpoll`。syscall ゼロ |
+
+**既定を eventfd にする理由**: 主要ターゲットが小型 PC (4〜8 コア) であり、
+コアを 1 本焼くコストが GGML の計算スループットに直接効く。
+`doctor` がコア数を見て推奨設定を提示する。
+
+### 15.5 NUMA 考慮
+
+主要ターゲット (ミニ PC / ノート) は単一 NUMA ノードなので通常は無関係。
+ただしワークステーション/サーバでは以下を行う:
+
+```
+1. NVMe デバイスの NUMA ノードを /sys/block/nvmeXn1/device/numa_node から取得
+2. GPU の NUMA ノードを取得
+3. 一致する場合  : Arena をそのノードへ確保 (mbind MPOL_BIND)、③⑤⑥ を pin
+4. 不一致の場合  : Arena は NVMe 側へ (I/O が支配的なため)、
+                   GPU 転送は PCIe 越えを許容
+5. --numa interleave : 大バッチスループット重視時のオプション
+```
+
+`--numa auto|bind|interleave|off`、既定は `auto`。
+
+### 15.6 スレッドモデルの検証
+
+```
+tests/concurrency/
+  ├─ loom_expert_state.rs      : Expert 状態機械を loom で全インタリーブ検証
+  ├─ loom_slot_alloc.rs        : slot 確保/解放の ABA 問題検証
+  ├─ tsan_e2e.sh               : ThreadSanitizer 下での E2E
+  └─ stress_cancel.rs          : プリフェッチキャンセルと完了の競合
+```
+
+**特に危険な競合**: 「eviction 決定 → refcount 確認 → slot 解放」の間に
+実行スレッドが同じ Expert を acquire する経路。
+これは `state` の CAS を `RESIDENT → EVICTING` で行い、
+`EVICTING` 状態の Expert を acquire できないようにすることで排除する。
+loom で網羅検証する。
+
+---
+
+## 16. Scheduler
+
+### 16.1 責務
+
+Scheduler は「次の Step に何を入れるか」だけを決める。
+MoEStream 固有の制約は **I/O 予算** である。
+
+```mermaid
+graph TB
+    W["Waiting Queue<br/>(新規リクエスト)"] --> AD{"Admission<br/>Control"}
+    AD -->|"メモリ・I/O 予算 OK"| R["Running Set"]
+    AD -->|"予算不足"| Q["Queued (429/待機)"]
+    R --> SEL["Step 構成<br/>(バッチ選択)"]
+    SEL --> BUD{"I/O 予算<br/>チェック"}
+    BUD -->|"超過"| TRIM["prefill チャンク縮小<br/>or セッション除外"]
+    TRIM --> SEL
+    BUD -->|"OK"| EXE["Execution へ"]
+    EXE --> R
+    R -->|"EOS / max_tokens"| FIN["完了"]
+```
+
+### 16.2 Continuous Batching
+
+vLLM/SGLang と同様、Step ごとに動的にバッチを組み替える。
+ただし MoEStream 固有の 2 点を追加する:
+
+| 追加要素 | 内容 |
+|---|---|
+| **I/O 予算制約** | バッチ構成時に「そのバッチが必要とする Expert union の推定サイズ」を計算し、Step の I/O 予算を超えないよう制限 |
+| **Expert Affinity** | Expert プロファイルが近いセッションを優先的に同一バッチへ (§26.4) |
+
+### 16.3 Step の I/O 予算
+
+```
+1 Step の I/O 予算 B_step = BW_effective × t_target_step
+
+t_target_step = 目標トークン間レイテンシ (例: 48 ms)
+BW_effective  = doctor の実測値 × 0.85 (安全率)
+
+推定必要 I/O:
+  E_union(batch) = Σ_L | ∪_{s∈batch} topk(s, L) \ resident |
+  ただし decode 前は正確に分からないので、
+  直前 Step の実測値 + prefill チャンク分の見積りで近似
+```
+
+**prefill チャンクサイズの動的決定**:
+
+```
+prefill チャンク c トークンは、ほぼ全 Expert に触れる。
+c ≥ 64 程度で d(c) → 256 に飽和するため、
+「1 層あたり 256 体を読む」= 486 MiB/層 × 40 = 19 GiB を 1 スイープで読む。
+
+したがって:
+  prefill は「チャンクサイズを大きくするほど 1 トークンあたりの I/O が減る」
+  → I/O 予算が許す限りチャンクを大きくすべき (decode と真逆の性質)
+
+  ただしチャンクを大きくすると decode の割り込みが遅れ、
+  他セッションの TBT (time between tokens) が悪化する。
+
+決定則:
+  chunk = clamp( B_step_remaining / bytes_per_prefill_token,  256,  2048 )
+  かつ、running な decode セッションがある場合は chunk を半減 (公平性)
+```
+
+### 16.4 Prefill/Decode の分離モード
+
+```mermaid
+stateDiagram-v2
+    [*] --> Mixed
+    Mixed: MIXED モード<br/>prefill chunk と decode を同一 Step に混ぜる
+    Mixed --> Isolated: decode セッション数 ≥ 2<br/>かつ TBT p99 悪化を検出
+    Isolated: ISOLATED モード<br/>prefill 専用 Step と decode 専用 Step を交互に<br/>(prefill:decode = 1:K)
+    Isolated --> Mixed: 負荷低下
+```
+
+**MoEStream 固有の理由**: prefill スイープは Expert Cache を
+バイパスして大量 I/O を発生させるため、
+同一 Step 内の decode の I/O 予算を食い潰す。
+分離することで decode の TBT を守る (PR-5)。
+
+### 16.5 Admission Control
+
+新規リクエストを受け入れる条件:
+
+```
+✓ KV/state 用メモリが確保できる
+    必要量 = GDN state 60 MiB + KV(推定 max_tokens) 
+✓ Expert Cache が S_min を下回らない
+✓ 現在の I/O 使用率 < 85%
+✓ 実行中セッション数 < --max-sessions
+
+いずれか不成立 → 
+  優先度が高いリクエスト: 既存の低優先度セッションを preempt (KV を SSD へ退避)
+  そうでない: キューイング (最大 --queue-timeout)、超過で 503 + Retry-After
+```
+
+### 16.6 デッドラインとプリエンプション
+
+各 Step には目標完了時刻がある。超過を検出した場合の対処階段:
+
+```mermaid
+graph TB
+    D["デッドライン超過検出"] --> L1["Level 1: プリフェッチ深度を下げる<br/>(投機 I/O を止め、帯域をデマンドへ)"]
+    L1 --> L2["Level 2: バッチサイズを縮小<br/>(次 Step から)"]
+    L2 --> L3["Level 3: soft モードなら<br/>低重み Expert をスキップ"]
+    L3 --> L4["Level 4: 新規 admission 停止"]
+    L4 --> L5["Level 5: 低優先度セッションを preempt"]
+```
+
+**Level 1 が最も重要**: 投機プリフェッチはデマンドフェッチと帯域を奪い合う。
+遅延が出ている瞬間は投機を止めるのが正しい。
+これを自動で行うのが `IoGovernor` (§13.5) との連携である。
+
+### 16.7 スケジューリングポリシー
+
+| ポリシー | 挙動 | 用途 |
+|---|---|---|
+| `fcfs` | 到着順 | 既定。予測可能 |
+| `fair` | セッション間で生成トークン数を均等化 | マルチ Agent 既定 |
+| `priority` | API で指定された優先度クラス | 対話 UI > バックグラウンド Agent |
+| `affinity` | Expert プロファイル類似度で束ねる | I/O 最小化重視 (§26.4) |
+
+---
+
+## 17. Memory Layout
+
+### 17.1 予算配分 (`--mem-budget 10GiB`, Qwen3.6-35B-A3B Q4_K_M)
+
+| 区分 | サイズ | 備考 |
+|---|---:|---|
+| **RESIDENT 重み** | | |
+| ─ Attention (10層) + GatedDeltaNet (30層) | 470 MiB | Q5_K/Q6_K |
+| ─ LM Head (output.weight) | 636 MiB | Q6_K、248,320 × 2048 |
+| ─ Shared Experts (40 × 1) | 76 MiB | PINNED |
+| ─ Router + Norm | 42 MiB | FP16 保持 (精度重要) |
+| ─ **小計** | **1,224 MiB** | |
+| **Expert Cache (可変)** | **7,600 MiB** | 3,908 slots / 10,240 (38.2%) |
+| **KV / State** | | |
+| ─ Paged KV (4 sess × 8K, Q8, 10層) | 320 MiB | 10 KiB/token |
+| ─ GDN 再帰状態 (4 sess × 30層 × 2 MiB) | 240 MiB | **文脈長に依存しない固定費** |
+| ─ ページテーブル/メタ | 8 MiB | |
+| ─ **小計** | **568 MiB** | |
+| **実行時** | | |
+| ─ 活性化・scratch (batch 32) | 180 MiB | |
+| ─ GGML グラフ・コンテキスト | 40 MiB | |
+| ─ IO staging (GGUF モード時のみ) | 0 MiB | `.msp` ではゼロコピー |
+| ─ Expert メタデータ (§11.1) | 1 MiB | |
+| ─ 較正統計・共活性化行列 | 6 MiB | |
+| ─ サーバ・アロケータ・断片化 | 220 MiB | |
+| ─ **小計** | **447 MiB** | |
+| **合計** | **9,839 MiB = 9.61 GiB** | 予算 10 GiB に対し 4% の余裕 |
+
+**ベースライン比**: llama.cpp フル常駐 21.3 GiB + KV 0.57 + 実行時 0.45 ≈ **22.3 GiB**
+→ MoEStream **9.61 GiB** = **57% 削減**。目標 (22 → 10 GB) を達成。
+
+> **UMA (iGPU) 環境での重要な補足**: 上表は「OS から見える RAM」を前提としている。
+> UMA 機では BIOS が iGPU 用に固定確保する carve-out が OS 可視 RAM から
+> 差し引かれるため、実際に使える量はさらに少ない。
+> 実測例では 8 GiB が carve-out されていた。**Appendix E.3 / E.4 を参照。**
+
+### 17.2 Arena レイアウト
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Host Arena (HugePages 2 MiB, 単一連続 mmap)                     │
+├────────────────────────────────────────────────────────────────┤
+│ [0]      RESIDENT 重み領域            1,224 MiB   read-only     │
+│          ├ attn/gdn weights                                    │
+│          ├ lm_head                                             │
+│          ├ shared experts (PINNED)                             │
+│          └ router / norms                                      │
+├────────────────────────────────────────────────────────────────┤
+│ [1]      gate_slab      S × 576 KiB   2,198 MiB   ← io_uring    │
+│ [2]      up_slab        S × 576 KiB   2,198 MiB   ← 登録領域     │
+│ [3]      down_slab      S × 840 KiB   3,204 MiB   ← (DMA 直書)   │
+├────────────────────────────────────────────────────────────────┤
+│ [4]      KV ページプール              320 MiB     ブロック割当   │
+│ [5]      GDN 状態プール               240 MiB     セッション固定  │
+├────────────────────────────────────────────────────────────────┤
+│ [6]      活性化 / scratch             180 MiB     step ごと再利用│
+│ [7]      メタデータ / 統計              7 MiB                    │
+└────────────────────────────────────────────────────────────────┘
+   ↑ [1][2][3] が IORING_REGISTER_BUFFERS の対象
+   ↑ arena 全体が VK_EXT_external_memory_host の import 対象 (UMA 時)
+```
+
+**単一連続 mmap にする理由**:
+- io_uring の buffer 登録が 1 回で済む (登録は高コスト)
+- Vulkan の host ptr import が 1 回で済む
+- 予算超過が構造的に不可能になる (arena を超えたら確保失敗)
+- RSS の測定が自明になる
+
+### 17.3 HugePages 戦略
+
+| 方式 | 利点 | 採用 |
+|---|---|---|
+| Explicit HugePages (`MAP_HUGETLB`) | 確実に 2 MiB ページ、swap されない | ⚠️ 事前予約 (`vm.nr_hugepages`) が要り root 権限相当。**OR-4 に反する** |
+| THP (`madvise(MADV_HUGEPAGE)`) | 権限不要、自動 | ✅ **既定** |
+| 4 KiB ページ | 常に動く | フォールバック |
+
+**なぜ HugePages が効くか**: Expert 1 体 = 1,992 KiB は 4 KiB ページなら 498 ページ。
+GEMM が全体を舐めるため TLB ミスが発生する。
+2 MiB ページなら 1 体がほぼ 1 ページに収まり、TLB プレッシャが 500 分の 1 になる。
+実測で 3〜8% のスループット差を見込む (§33 で検証)。
+
+`slot_size = 2 MiB` に切り上げるか、`1,992 KiB` のまま詰めるかはトレードオフ:
+- 2 MiB に切り上げ: 0.4% のメモリ損失、TLB 効率最大、アドレス計算が単純
+- **決定: 2 MiB に切り上げる。** 0.4% は誤差、TLB とアライメントの利得が上回る。
+
+### 17.4 ROW_LOOKUP: Embedding のストリーミング
+
+```
+入力 Embedding (248,320 × 2048, Q4_K) = 546 MiB
+
+1 ステップで必要な行数 = バッチトークン数 (典型 1〜32)
+1 行のサイズ = 2048 weights = 8 superblock × 144 B = 1,152 B
+
+読出方法:
+  行 r のオフセット = base + r × 1,152
+  → 4 KiB アラインへ切り下げて 8 KiB 読出 (1 行が境界跨ぎでも収まる)
+  → バッチ 32 なら 32 SQE、合計 256 KiB
+  → 1 Step の I/O 予算 (288 MB) に対し 0.09%。無視できる
+
+さらに: 直近使用トークンの Embedding 行を小さな LRU (1,024 行 = 1.1 MiB) に保持
+  → 対話では同じトークンが頻出するのでヒット率は高い
+```
+
+**546 MiB を 1.1 MiB に置き換える。** 大語彙モデル全般に効く。
+
+### 17.5 断片化の排除
+
+| 領域 | 断片化リスク | 対策 |
+|---|---|---|
+| Expert slab | なし | 固定サイズ slot + free list |
+| KV ページ | なし | 固定サイズブロック (PagedAttention 方式、16 token/block) |
+| GDN 状態 | なし | セッションごと固定サイズ (2 MiB × 30層) |
+| 活性化 | 低 | step ごとに bump allocator でリセット |
+| メタ/文字列 | 低 | 通常のアロケータだが予算外の小領域 |
+
+**全ての大領域が固定サイズブロック**であることが、
+長時間稼働デーモンにおける RSS 安定性を保証する。
+72 時間の soak テストで RSS が単調増加しないことを CI で検証する (§33.7)。
+
+---
+
+## 18. SSD Layout
+
+### 18.1 `.msp` (MoEStream Pack) コンテナ形式
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ HEADER (4 KiB)                                                  │
+│   magic "MSPK", format_version, flags                           │
+│   model_uuid, source_gguf_sha256                                │
+│   section_table_offset, section_count                           │
+│   alignment (既定 4096), expert_record_align (既定 2 MiB)        │
+├─────────────────────────────────────────────────────────────────┤
+│ SECTION TABLE                                                   │
+│   [0] MANIFEST      (JSON, モデル形状・Spec 参照)                │
+│   [1] DENSE         (RESIDENT クラスのテンソル群)                │
+│   [2] EMBED         (ROW_LOOKUP クラス、行アライン)              │
+│   [3] EXPERT_INDEX  (10,240 エントリ)                            │
+│   [4] EXPERT_DATA   (本体、人気度順に配置)                        │
+│   [5] CALIB         (較正統計・共活性化・hot set)                 │
+│   [6] PREDICTOR     (学習済み予測器の重み, 任意)                  │
+│   [7] CHECKSUM      (per-expert CRC32C / BLAKE3)                 │
+├─────────────────────────────────────────────────────────────────┤
+│ ... 各セクション本体 ...                                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 18.2 EXPERT_INDEX エントリ (32 B / expert)
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `offset` | u64 | EXPERT_DATA 内の絶対オフセット (2 MiB アライン) |
+| `len` | u32 | レコード長 |
+| `member_len[3]` | u32×3 | gate/up/down の各長 (readv の iovec 長に直接使う) |
+| `tier` | u8 | 精度 tier (0=主, 1=低精度代替) |
+| `layer` | u16 | 冗長だが検証用 |
+| `expert` | u16 | 同上 |
+| `popularity_rank` | u16 | 較正時の順位 |
+| `_pad` | — | 32 B へ整列 |
+
+**10,240 × 32 B = 320 KiB。起動時に全読込。** ハッシュ不要、密配列。
+
+### 18.3 EXPERT_DATA の物理配置
+
+```
+配置順 = popularity_rank 昇順 (較正データがある場合)
+
+┌────────────────────────────────────────────────────────┐
+│ rank 0..511    : 最ホット (PINNED 候補)                 │  ← 物理的に先頭
+│ rank 512..2047 : ホット                                │      に固まる
+│ rank 2048..6143: 中庸                                  │
+│ rank 6144..10239: コールド                             │
+└────────────────────────────────────────────────────────┘
+```
+
+**なぜ人気度順に並べるか**:
+1. **SSD の readahead / 内部プリフェッチと相性が良い** — ホット Expert が
+   物理的に近接していると、SSD 内部のチャネル/プレーン並列が効きやすい。
+2. **起動時のウォームアップが逐次読出になる** — hot set を載せる際、
+   ランダム 2 MiB 読出 (≈4 GB/s) ではなく **完全逐次読出 (≈7 GB/s)** になる。
+   7.6 GiB のウォームアップが 1.9 s → 1.1 s に短縮。
+3. **ファイルシステムのエクステント断片化が減る**。
+
+**層ごとにブロック化しないのはなぜか**: prefill スイープ (§20.2) は層ごとに
+全 Expert を舐めるため層クラスタの方が有利に見える。しかし
+prefill は全体を読むので順序は無関係 (どちらも 19 GiB の逐次読出)。
+一方 decode の hot set 読出は人気度順が明確に有利。よって **人気度順を採る**。
+
+> **代替案として検討し却下**: 「層 × 人気度」の 2 次元 Z-order 配置。
+> 利得が測定困難な割に pack の複雑性が増す。§33 で単純比較して
+> 有意差があれば採用する (ADR-0011 で追跡)。
+
+### 18.4 アライメント設計
+
+| 境界 | 値 | 理由 |
+|---|---|---|
+| Expert レコード開始 | **2 MiB** | HugePage 境界と一致、NVMe の内部 IU (Indirection Unit) を跨がない |
+| 各メンバ (gate/up/down) | **4 KiB** | O_DIRECT の最小要件。pack 時にパディング |
+| セクション | 4 KiB | |
+| EMBED の行 | 詰める (1,152 B) | 8 KiB 読出で吸収するのでアライン不要 |
+
+Qwen3.6 の実際の値:
+```
+gate: 589,824 B = 144 × 4 KiB   ✅ パディング 0
+up  : 589,824 B = 144 × 4 KiB   ✅ パディング 0
+down: 860,160 B = 210 × 4 KiB   ✅ パディング 0 (Q6_K)
+────────────────────────────────
+合計 2,039,808 B = 498 × 4 KiB
+2 MiB (2,097,152 B) へ切り上げ → パディング 57,344 B (2.7%)
+
+ディスク上の総サイズ = 10,240 × 2 MiB = 20.0 GiB
+(パディングなしなら 19.45 GiB。0.55 GiB = 2.7% の増加)
+```
+
+**2.7% のディスク増加で、HugePage 整合・IU 整合・アドレス計算の単純化を買う。**
+`--pack-align 4096` で無効化可能 (省容量優先時)。
+
+### 18.5 複数モデルの共存
+
+```
+~/.cache/moestream/
+  models/
+    qwen3.6-35b-a3b-q4km-<uuid>.msp        20.0 GiB
+    glm-4.5-air-q4km-<uuid>.msp            58.2 GiB
+    index.json                              (uuid ↔ パス ↔ メタ)
+  calib/
+    <uuid>-global.calib
+    <uuid>-domain-code.calib
+```
+
+同一プロセスで複数モデルを保持する場合、**Expert Cache は
+モデルごとに独立した arena セグメント**として確保する
+(スロットサイズが違うため共有できない)。
+Memory Governor がモデル間の予算配分を管理する (§31.4)。
+
+### 18.6 精度 Tier (オプション機能)
+
+較正で得た人気度に基づき、**コールド Expert を低精度で追加保存**する。
+
+```
+tier 0 (主) : 全 Expert を Q4_K_M で保存        20.0 GiB
+tier 1 (代替): rank ≥ 4096 の Expert を Q2_K で   6,144 × 1.0 MiB = 6.0 GiB
+```
+
+| 効果 | 説明 |
+|---|---|
+| **miss コストの削減** | コールド Expert の miss 時、tier 1 を読めば I/O が 1/2 |
+| **品質影響が小さい** | 稀にしか使われない Expert の劣化は出力全体への寄与が小さい |
+| **`turbo` モード専用** | `strict`/`soft` では使わない (QR-1 を守る) |
+| コスト | ディスク +6 GiB、tier ごとに別 slab が必要 (§10.4 の制約) |
+
+**判断: v1.1 のオプション機能とする。** 効果は §33.6 で測定してから既定を決める。
+理論上は「miss バイト数を 30〜40% 削減 = 実効帯域 1.5 倍」に相当し、
+低速 SSD 環境 (PR-1 の 3.5 GB/s 行) を救う可能性がある。
+
+### 18.7 ファイルシステムの選択
+
+| FS | 評価 |
+|---|---|
+| **ext4** | ✅ 推奨。O_DIRECT が素直、エクステント断片化が少ない |
+| **XFS** | ✅ 推奨。大ファイル・並列 I/O に強い |
+| Btrfs (CoW 有効) | ⚠️ 断片化しやすい。`chattr +C` で CoW 無効化を推奨 (pack 時に自動実施を試みる) |
+| ZFS | ⚠️ ARC が page cache と別に RAM を食う。`primarycache=metadata` 推奨 |
+| overlayfs (コンテナ) | ⚠️ O_DIRECT が効かない場合あり。`.msp` はボリュームマウントを推奨 |
+| LUKS 暗号化 | ⚠️ CPU コストで帯域が 20〜40% 低下しうる。`doctor` で検出して警告 |
+
+`moestream doctor` がこれらを検出し、警告と対処法を提示する。
+
+---
+
+## 19. Metadata 設計
+
+### 19.1 メタデータの 3 層
+
+```mermaid
+graph TB
+    A["① Model Spec (TOML)<br/>アーキテクチャ族の規則<br/>リポジトリに同梱、人間が書く"]
+    B["② Model Manifest (.msp 内 JSON)<br/>個体の形状・テンソル配置<br/>pack が生成"]
+    C["③ Calibration Profile (.calib)<br/>Expert 統計・共活性化・hot set<br/>calibrate が生成、更新される"]
+    A --> B --> C
+    D["④ Runtime Profile (~/.cache)<br/>実機での実測帯域・最適 QD<br/>doctor / 実行中に更新"] 
+    C --> D
+```
+
+### 19.2 Model Manifest (抜粋)
+
+```json
+{
+  "manifest_version": 1,
+  "model_uuid": "018f2c...",
+  "spec": { "family": "qwen3.6-moe", "spec_version": 1 },
+  "source": {
+    "gguf_sha256": "9a3f...",
+    "gguf_arch": "qwen3next",
+    "quantization": "Q4_K_M"
+  },
+  "shape": {
+    "n_layer": 40, "n_embd": 2048, "n_vocab": 248320,
+    "n_head": 16, "n_head_kv": 2, "head_dim": 256,
+    "n_expert": 256, "n_expert_used": 8, "n_expert_shared": 1,
+    "n_ff_exp": 512,
+    "layer_types": ["linear_attn","linear_attn","linear_attn","full_attn", "..."],
+    "linear_attn": { "n_v_head": 32, "n_k_head": 16, "k_dim": 128, "v_dim": 128, "conv_k": 4 }
+  },
+  "residency": {
+    "resident_bytes": 1283457024,
+    "streamed_bytes": 20883701760,
+    "row_lookup_bytes": 572522496
+  },
+  "expert_object": {
+    "count": 10240,
+    "record_bytes": 2097152,
+    "member_bytes": [589824, 589824, 860160],
+    "member_types": ["Q4_K", "Q4_K", "Q6_K"]
+  },
+  "derived": {
+    "active_expert_bytes_per_token": 652738560,
+    "estimated_regime": "B",
+    "required_hit_rate_at_6GBps_for_20pct": 0.559
+  }
+}
+```
+
+**`derived` セクションが重要**: §2 の解析モデルの計算結果を
+マニフェストに焼き込んでおくことで、
+起動時に「このモデルは本ランタイムに適合するか」を即座に判定できる。
+`estimated_regime == "A"` の場合は起動時に警告を出す:
+
+```
+⚠  このモデルは active expert bytes/token = 11.2 GB で Regime A に該当します。
+   MoEStream の設計前提 (I/O を計算で隠せる) から外れており、
+   期待速度は 0.5 tok/s 程度です。
+   700B 級には Colibri (https://github.com/JustVugg/colibri) を推奨します。
+   続行する場合は --allow-regime-a を指定してください。
+```
+
+**ユーザを他プロジェクトへ正しく誘導する**ことを実装レベルで行う (§3.4, P8)。
+
+### 19.3 Calibration Profile
+
+```
+CALIB セクション:
+  ├─ header: corpus_id, token_count, timestamp, domain_tag
+  ├─ freq[10240]         : u32   活性化回数              40 KiB
+  ├─ weight_mass[10240]  : f32   ルータ重み累積          40 KiB
+  ├─ seq_entropy[40]     : f32   層ごとのルーティング分散 160 B
+  ├─ hot_set[]           : u16   PINNED 推奨リスト
+  └─ coact[40]           : 層ごとの共活性化 (疎形式)
+        各 expert について上位 16 個の共活性パートナー
+        10240 × 16 × (u16 + u16) = 640 KiB
+```
+
+**共活性化の疎表現**: 密行列は 256² × 40 × 4 B = 10.5 MiB だが、
+上位 16 パートナーだけ持てば 640 KiB。
+プリフェッチ (§22.4) には上位のみで十分。
+
+**複数ドメインの同梱**:
+```
+moestream calibrate model.msp --corpus code.txt      --tag code
+moestream calibrate model.msp --corpus japanese.txt  --tag ja
+moestream calibrate model.msp --corpus general.txt   --tag general
+→ .msp に 3 つの CALIB を格納、起動時に --calib-tag で選択
+→ あるいは実行中にセッションのプロファイルを見て自動選択 (v1.2)
+```
+
+### 19.4 Runtime Profile (実機較正)
+
+```
+~/.cache/moestream/runtime-<machine-id>.json
+{
+  "storage": {
+    "device": "nvme0n1",
+    "seq_read_bw": 6.42e9,
+    "rand_2mib_bw": 5.81e9,
+    "lat_p50_us": 78, "lat_p99_us": 210,
+    "optimal_qd": 48,
+    "supports_odirect": true
+  },
+  "gpu": { "h2d_bw": 12.1e9, "topology": "UNIFIED", "host_ptr_import": true },
+  "compute": { "baseline_tok_s_est": 28.1, "prefill_tok_s_est": 940 },
+  "measured_at": "2026-08-02T10:00:00Z"
+}
+```
+
+これにより 2 回目以降の起動が高速化し、
+かつ §16.3 の I/O 予算計算に実測値を使える。
+
+### 19.5 バージョニングと互換性
+
+| 対象 | 方式 | 非互換時の挙動 |
+|---|---|---|
+| `.msp` format_version | 整数。ランタイムが対応範囲を持つ | 明確なエラー + 再 pack の指示 |
+| Model Spec spec_version | 整数 | 古い Spec は読める (前方互換を維持) |
+| Calibration | 任意。無くても動く | 無ければ PINNED なしで起動 |
+| Predictor 重み | 任意 | 無ければヒューリスティック予測器のみ |
+
+**原則: 較正データと予測器は常にオプショナル。**
+無くても正しく動き、あれば速くなる。これは
+「まず動かしてみる」ユーザ体験を守るために重要である。
+
+---
+
+## 20. 推論シーケンス
+
+### 20.1 起動シーケンス
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as ユーザ
+    participant M as main
+    participant D as Doctor
+    participant G as MemoryGovernor
+    participant S as Storage
+    participant C as CacheMgr
+    participant GB as GpuBackend
+
+    U->>M: moestream serve --model x.msp --mem-budget 10GiB
+    M->>S: open(.msp), HEADER + SECTION TABLE 読込
+    M->>M: MANIFEST 検証 (regime 判定, §19.2)
+    M->>D: 実機プロファイル取得 (キャッシュ or 実測)
+    D-->>M: bw=6.42GB/s, qd=48, UMA, host_ptr_import=ok
+    M->>G: 予算 10GiB を宣言
+    G->>G: 配分計算 (§17.1)
+    G->>M: arena size = 9.61GiB
+    M->>M: HugePages で arena を単一 mmap
+    M->>S: IORING_REGISTER_BUFFERS(slab 領域)
+    M->>GB: VK_EXT_external_memory_host で arena を import
+    GB-->>M: zero-copy 経路確立 ✅
+    M->>S: DENSE セクション読込 → RESIDENT 領域へ (1.2 GiB, 逐次)
+    M->>C: CALIB 読込 → hot_set 決定
+    C->>S: hot set を逐次読出 (人気度順に連続配置なので高速)
+    S-->>C: 2,048 experts (4.0 GiB) を 0.62 s で充填
+    M->>M: HTTP listen 開始
+    M-->>U: ready (総 2.4 s)
+```
+
+**起動時間の内訳目標**: メタ 0.05 s + DENSE 0.2 s + hot set 1.1 s + 初期化 0.3 s ≈ **1.7 s**。
+`--warm-cache=none` なら 0.6 s で ready (最初のリクエストで温まる)。
+
+### 20.2 Prefill シーケンス — 「Expert スイープ」戦略 ★
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SC as Scheduler
+    participant EX as Execution
+    participant EM as ExpertMgr
+    participant IO as Storage
+    participant C as CacheMgr
+
+    Note over SC: prompt 2,048 tokens<br/>chunk = 2,048 (1 チャンク)
+    SC->>EX: prefill step (2048 tok)
+
+    loop 層 L = 0..39
+        EX->>EX: Mixer (GQA/GDN) → Router
+        EX->>EM: 層 L の全 256 expert が必要 (2048 tok では union ≈ 256)
+        Note over EM,IO: ★ デマンドフェッチではなく<br/>「層 L の EXPERT_DATA を逐次スイープ」
+        EM->>IO: 層 L の 256 レコードを<br/>順次 readv (逐次読出パターン)
+        IO-->>EM: 到着順に完了
+        EM->>EX: 到着順ディスパッチ (§11.5)
+        EX->>EX: expert e に割り当てられた token 群へ grouped GEMM
+        EM->>C: ★ admit しない (バイパス, §12.4)<br/>ただし freq 統計は記録
+        Note over EM: スイープ用の小さなリングバッファ<br/>(64 slot = 128 MiB) を巡回使用
+    end
+
+    EX-->>SC: prefill 完了、logits
+    Note over C: 記録した freq から<br/>セッション Expert プロファイルを構築<br/>→ decode 用に hot set を再構成
+```
+
+**この戦略が優れている理由**:
+
+| 観点 | デマンドフェッチ | **Expert スイープ** |
+|---|---|---|
+| I/O パターン | ランダム 2 MiB | **完全逐次** |
+| 実効帯域 | ≈5.8 GB/s | **≈7.0 GB/s** (+20%) |
+| キャッシュ汚染 | 全損 | **ゼロ** (バイパス) |
+| 必要バッファ | Expert Cache 全体 | **128 MiB のリング** |
+| 総 I/O 量 | 20 GiB | 20 GiB (同じ) |
+| 所要時間 | 3.4 s | **2.9 s** |
+
+**さらに: prefill が decode 用キャッシュを温める副作用を持つ。**
+prefill 中に記録した「このセッションで実際に使われた Expert 頻度」は、
+decode 開始時点で最良の予測情報である (MoE-Infinity の EAM に相当)。
+prefill 終了時に、この情報で hot set を再構成する。
+
+**プロンプトが短い場合**: `union(topk) < 256` なら通常のデマンドフェッチが有利。
+閾値: `prompt_tokens < 64` (このとき union ≈ 200 未満) でモード切替。
+
+### 20.3 Decode シーケンス (定常状態)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant EX as Execution
+    participant PF as PrefetchEngine
+    participant EM as ExpertMgr
+    participant IO as Storage
+
+    Note over EX,IO: 層 L−4 〜 L+4 のパイプラインが常時走っている
+
+    EX->>EX: 層 L: Mixer 実行 (0.4 ms)
+    EX->>EX: 層 L: Router GEMM (0.02 ms)
+    EX->>PF: ★ 確定 ids[8] を即通知 (P0)
+    PF->>PF: 予測器融合: 層 L+1..L+4 の候補を更新
+    PF->>IO: 優先度付き ReadReq をバッチ提出
+
+    EX->>EM: acquire(L, ids[8])
+    EM-->>EX: hit 6 / miss 2 (ヒット率 75%)
+    EM->>IO: 2 件を URGENT で発行 (キュー先頭挿入)
+
+    EX->>EX: Shared Expert 実行 (0.05 ms) ← ここも I/O 秘匿に使う
+    EX->>EX: hit した 6 体を GEMM (0.42 ms)
+    IO-->>EM: miss 2 件の CQE (0.33 ms 後)
+    EM-->>EX: ready
+    EX->>EX: 残り 2 体を GEMM (0.14 ms)
+    EX->>EX: 固定順 reduce + residual add
+
+    Note over EX: 層 L の実測 1.03 ms<br/>(理論下限 1.00 ms, ストール 0.03 ms)
+    EX->>EX: 層 L+1 へ
+```
+
+**タイミング分析 (層あたり)**:
+```
+計算時間     : 1.00 ms  (Mixer 0.40 + Router 0.02 + Shared 0.05 + Expert GEMM 0.53)
+miss I/O     : 2 体 × 1.992 MiB / 6.0 GB/s = 0.66 ms
+              ↑ ただし URGENT 発行は Router 直後 (計算 0.60 ms 前)
+実効ストール : 0.66 − 0.60 = 0.06 ms  (プリフェッチが当たれば 0)
+```
+
+**プリフェッチが 4 層先まで効いていれば、miss はそもそも
+「4 ms 前に発行済み」なのでストールはゼロになる。**
+これが §22 の設計目標である。
+
+### 20.4 マルチセッション Step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S1 as Session 1
+    participant S2 as Session 2
+    participant S3 as Session 3
+    participant SC as Scheduler
+    participant EX as Execution
+
+    S1->>SC: decode 要求 (ready)
+    S2->>SC: decode 要求 (ready)
+    S3->>SC: prefill 1,024 tok (ready)
+    SC->>SC: I/O 予算計算: decode 2 tok + prefill chunk
+    SC->>SC: prefill が予算を食うので chunk を 512 へ縮小
+    SC->>EX: Step(batch = [s1:1, s2:1, s3:512])
+    loop 層 0..39
+        EX->>EX: 3 セッションの token を連結して Mixer
+        EX->>EX: Router → union of experts
+        Note over EX: s1,s2 は 8+8 → union 14 (重複 2)<br/>s3 は 512 tok で union ≈ 250<br/>合計 union ≈ 252
+        EX->>EX: expert ごとに grouped GEMM<br/>(その expert を選んだ全 token をまとめて)
+    end
+    EX-->>SC: s1 token, s2 token, s3 prefill 進捗
+    SC->>S1: SSE chunk
+    SC->>S2: SSE chunk
+```
+
+**観察**: prefill が混ざると union が跳ね上がる。
+これが §16.4 の「ISOLATED モード」を用意する理由である。
+
+### 20.5 キャッシュミス時の詳細フロー
+
+```mermaid
+stateDiagram-v2
+    [*] --> Acquire
+    Acquire: acquire(layer, expert)
+    Acquire --> Hit: state == RESIDENT_*
+    Acquire --> InFlight: state == IN_FLIGHT<br/>(プリフェッチ中)
+    Acquire --> Miss: state == EVICTED
+
+    Hit --> Done: refcount++ → 即実行可
+
+    InFlight --> Promote: 優先度を URGENT へ昇格<br/>(既に発行済なのでキュー順のみ変更)
+    Promote --> WaitCq
+    
+    Miss --> Alloc: slot 確保
+    Alloc --> NoSlot: 空きなし
+    NoSlot --> Evict: eviction 実行
+    Evict --> Alloc
+    NoSlot --> Blocked: evict 不能<br/>(全て refcount>0)
+    Blocked --> Alloc: 他 Expert 解放待ち<br/>★設計上のアラート
+    Alloc --> SubmitUrgent: URGENT readv 発行
+    SubmitUrgent --> WaitCq
+
+    WaitCq: CQE 待ち<br/>(他 Expert の GEMM 中)
+    WaitCq --> Done: 完了
+    WaitCq --> Deadline: デッドライン超過
+    Deadline --> Skip: soft/turbo かつ w_i < τ
+    Deadline --> WaitCq: strict (待ち続ける)
+    Skip --> Done: 再正規化して続行
+
+    Done --> [*]
+```
+
+---
+
+## 21. キャッシュ戦略
+
+### 21.1 スコアリング関数
+
+DYNAMIC セグメントの eviction 候補選定に用いる。
+S3-FIFO の基本動作に、MoE 固有の補正を加える。
+
+```
+score(e) = freq_ema(e) × w̄(e) × affinity(e) / age_penalty(e)
+
+freq_ema(e)   : 指数移動平均の活性化頻度  (半減期 = 2,048 step)
+w̄(e)          : 過去のルータ重み平均       (重要な expert は重みも大きい)
+affinity(e)   : 現在アクティブなセッションの
+                プロファイルにおける出現確率 (§26.4)
+age_penalty(e): 1 + log2(1 + steps_since_last_use / 256)
+```
+
+**`w̄(e)` を入れる理由**: 同じ頻度でも、ルータ重み 0.35 で選ばれる expert と
+0.02 で選ばれる expert では、キャッシュする価値が違う。
+後者は miss しても `soft` モードでスキップできる。
+**「キャッシュ価値 = 使用頻度 × 出力への寄与度」** という定式化。
+
+### 21.2 ポリシー階層のまとめ
+
+```mermaid
+graph TB
+    R["Expert 参照"] --> P{"PINNED?"}
+    P -->|Yes| H1["即ヒット、統計のみ更新"]
+    P -->|No| D{"DYNAMIC に<br/>存在?"}
+    D -->|"SMALL に存在"| PR["freq++ → MAIN へ昇格<br/>(2 回目の参照)"]
+    D -->|"MAIN に存在"| H2["ヒット、freq_ema 更新"]
+    D -->|"GHOST に存在"| G["★ MAIN へ直接挿入<br/>(過去に居た = 価値の証拠)<br/>+ 層クォータ調整シグナル"]
+    D -->|"なし"| M["ミス → fetch"]
+    M --> AD{"Admission<br/>判定 (§12.4)"}
+    AD -->|"demand / 高確度 PF"| S["SMALL 先頭へ"]
+    AD -->|"低確度 PF"| S2["SMALL 末尾へ"]
+    AD -->|"prefill sweep"| BY["バイパス (admit なし)"]
+```
+
+### 21.3 hot set の動的再構成
+
+PINNED セットは静的ではなく、以下の契機で再構成する:
+
+| 契機 | 動作 |
+|---|---|
+| 起動時 | `.msp` の CALIB (選択されたドメイン) から構築 |
+| **prefill 完了時** | そのセッションの Expert プロファイルを反映 (§20.2) |
+| 定期 (8,192 step ごと) | 実測 `freq_ema` の上位で置換。ただし入替は 1 回あたり最大 5% (振動防止) |
+| セッション終了時 | そのセッションの寄与分を減衰 |
+| ドメイン変化検出時 | 分布の KL ダイバージェンスが閾値超過で再構成 |
+
+**振動 (thrashing) 防止**: PINNED の入替にはヒステリシスを設ける。
+「現在 PINNED でない expert が PINNED の下位 10% を **1.5 倍以上**上回る」
+場合にのみ入替を行う。
+
+### 21.4 なぜこの構成なのか — 設計判断の総括
+
+| 判断 | 選択 | 却下した代替 | 理由 |
+|---|---|---|---|
+| キャッシュ粒度 | **Expert (1.99 MiB)** | Layer / Tensor / Page | 層は粗すぎ (486 MiB)、tensor は 3 倍の I/O、page は意味的単位でない |
+| 置換アルゴリズム | **S3-FIFO + PINNED** | LRU / ARC / W-TinyLFU 単体 | スキャン耐性 + 低ロック競合 + 実装単純性 |
+| 頻度追跡 | **厳密カウンタ (配列)** | Count-Min Sketch | 10,240 個なら厳密が可能で、近似の誤差を持ち込む理由がない |
+| Admission | **流入元で差別化** | 一律 admit | prefill スイープによる全損を防ぐ |
+| 層別配分 | **ゴーストによる適応** | 均等 / 静的プロファイル | 限界効用を測って配る方が理論的に正しく、実装コストも小さい |
+| 統計の永続化 | **`.calib` に保存** | メモリのみ | 再起動でウォームアップ時間が消えるのは UX 上重大 |
+
+### 21.5 ヒット率の理論的見積り
+
+較正データが無い現時点では、Zipf 分布を仮定した見積りを置く
+(実測で置き換えることが §33.4 の目的)。
+
+```
+Zipf パラメータ s の分布で、上位 f の割合をキャッシュしたときのヒット率:
+  h(f) ≈ f^(1−s) / 1     (s < 1 の場合、正規化定数を無視した近似)
+
+キャッシュ率 f = 3,908/10,240 = 38.2%
+
+s = 0.3 (弱い歪み、負荷分散損失が強く効いている場合) → h ≈ 51%
+s = 0.5 (中程度)                                     → h ≈ 62%
+s = 0.7 (強い歪み、シーケンス局所性が支配的)          → h ≈ 74%
+s = 0.9 (非常に強い)                                 → h ≈ 87%
+```
+
+必要ヒット率は §2.3 より **55.9%** (6 GB/s、20% 低下)。
+つまり **`s ≳ 0.45` であれば目標達成**。
+
+> **これは検証すべき最重要仮説である。**
+> Qwen3.6 の負荷分散損失 (係数 0.001) がグローバル分布を平坦化していても、
+> 単一セッション内での実効的な歪みは大きいと期待される。
+> §33.4 でこれを最優先で測定し、結果を公開する。
+> **もし `s < 0.45` だった場合の対応策**は §32.1 に用意してある。
+
+---
+
+## 22. Prefetch 戦略
+
+### 22.1 全体像
+
+```mermaid
+graph TB
+    subgraph PRED["予測器 (並列に動作)"]
+        P0["P0: 確定<br/>現層の router 出力<br/>確度 100%"]
+        P1["P1: 時間局所性<br/>前トークンの同層 expert<br/>確度 40〜70%"]
+        P2["P2: 層先読み<br/>層 L+d の router を<br/>現 residual に適用<br/>確度 50〜85%"]
+        P3["P3: 学習予測器<br/>小型 MLP head<br/>確度 70〜90% (期待)"]
+        P4["P4: セッションプロファイル<br/>prefill/過去の頻度分布<br/>確度 (事前分布)"]
+        P5["P5: 共活性化<br/>選ばれた expert の<br/>共活性パートナー"]
+    end
+    P0 --> F["融合器<br/>score = Σ wᵢ·pᵢ(e)"]
+    P1 --> F
+    P2 --> F
+    P3 --> F
+    P4 --> F
+    P5 --> F
+    F --> PQ["優先度キュー<br/>(層 × 予測時刻でバケット化)"]
+    PQ --> BG["帯域ガバナ<br/>(§22.8)"]
+    BG --> IO["Storage へ発行"]
+    IO -.->|"実測ヒット寄与"| LRN["重み wᵢ の<br/>オンライン更新"]
+    LRN -.-> F
+```
+
+### 22.2 P0: 確定情報の即時通知
+
+層 L の Router が確定した瞬間、その 8 個は「確実に必要」である。
+既に IN_FLIGHT なら URGENT へ昇格、EVICTED なら即発行。
+
+**発行タイミングの最適化**: Router GEMM は極小 (2048×256) なので、
+**Mixer の計算中に Router を先に実行できないか?** → できない (Mixer 出力が Router の入力)。
+しかし **Mixer の出力が確定した直後、residual add の前に Router を実行**することで
+0.05〜0.1 ms 早く発行できる。グラフ構築時にこの順序を強制する。
+
+### 22.3 P1: 時間局所性 (前トークンの再利用)
+
+```
+prev_experts[L] = 前トークンが層 L で選んだ 8 個
+→ 現トークンでも選ばれる確率は経験的に 40〜70%
+
+コスト: ほぼゼロ (配列参照)
+効果 : 層 L の実行より遥か前 (前トークンの時点) に発行できる
+      = 40 ms のリードタイム。最も「早い」予測器
+```
+
+**最も安価で最も先行する予測器**であり、ベースラインとして必ず有効化する。
+
+### 22.4 P5: 共活性化グラフ
+
+較正で得た「expert e が選ばれたとき、同時に選ばれやすい上位 16 個」を使う。
+
+```
+層 L で expert e が確定 (P0) → 同層の共活性パートナーは既に確定済なので不要
+                              ↓
+実際の用途: 層 L の選択から 層 L+1 の候補を推定する
+  cross_layer_coact[L→L+1][e] = 層 L で e が選ばれたとき
+                                 層 L+1 で選ばれやすい expert
+```
+
+**層間共活性化** (cross-layer co-activation) が本質的に有用。
+較正時に `(層L の選択, 層L+1 の選択)` の共起を記録し、
+上位 16 パートナーを保存する。サイズは §19.3 と同じ 640 KiB。
+
+### 22.5 P4: セッション Expert プロファイル (EAM 相当)
+
+```
+各セッションについて、直近 W トークン (既定 512) の
+expert 活性化ヒストグラム H_s[10240] を維持 (u16, 20 KiB/session)
+
+予測: P4(e) = H_s[e] / Σ H_s
+用途: 事前分布として他の予測器のスコアに乗算する
+```
+
+**MoE-Infinity の Expert Activation Matrix の考え方**を、
+セッション単位のオンライン更新版として実装する。
+prefill で得たプロファイル (§20.2) が初期値になる。
+
+### 22.6 P2 / P3: 層先読み予測器
+
+**P2 (パラメータ不要)**: 層 L の hidden state `h_L` に対し、
+層 `L+d` の Router 重み `W_{L+d}` を適用して top-k を推定する。
+
+```
+pred_{L+d} = topk( σ( W_{L+d} · h_L ) )
+```
+
+Transformer の residual stream は層をまたいで緩やかにしか変化しないため、
+`d` が小さければ有効に働く (Mixtral-offloading で実証されている手法)。
+コスト: `2048 × 256 × 4 層 = 2.1 M MAC` — 無視できる。
+
+**P3 (学習あり)**: `h_L` から `L+d` 層の expert 集合を予測する小型 MLP。
+
+```
+predictor_{d}: h_L (2048) → hidden (256) → logits (256)
+パラメータ: 2048×256 + 256×256 = 590 K × 4 層 × 40 = 94 M ... 大きすぎる
+
+改良: 層共有 + 層埋め込み
+predictor: [h_L (2048) ⊕ layer_emb(64) ⊕ d_emb(16)] → 256 → 256
+パラメータ: 2128×256 + 256×256 = 610 K  (FP16 で 1.2 MiB)
+```
+
+**設計判断: P3 は v1.2 のオプション機能。**
+`.msp` の PREDICTOR セクションに格納し、無ければ P2 で代替する。
+学習は `moestream train-predictor` で数分で完了する
+(教師データは較正コーパスの forward pass から自動生成)。
+
+**予測器の評価指標**: 単なる精度ではなく **「有効リードタイム」** で測る。
+
+```
+effective_lead_time(e) = (e が実際に必要になった時刻) − (プリフェッチ発行時刻)
+有用なプリフェッチ = effective_lead_time > (I/O レイテンシ) かつ 実際に使われた
+```
+
+### 22.7 先読み深度 D の決定
+
+```
+深すぎる: 予測精度が落ち、無駄 I/O が増え、キャッシュを汚染する
+浅すぎる: I/O レイテンシを隠しきれずストールする
+
+必要条件: D × t_layer ≥ I/O レイテンシ + キュー待ち
+         D × 1.0 ms ≥ 0.33 ms (2 MiB 読出) + 0.2 ms (キュー)
+         D ≥ 0.53  → D = 1 でも理論上は足りる
+
+しかし実際には:
+  - p99 の I/O レイテンシは p50 の 3 倍 (1.0 ms)
+  - 複数 Expert が同時に必要 (8 個中 3 個 miss なら 2.0 ms)
+  → D = 4 で 4 ms の余裕を確保
+
+上限: 予測精度が D=4 で 60% を切るなら D を減らす
+```
+
+**適応制御**: `D` は実測ストール率と予測ヒット率から自動調整する。
+
+```
+stall_rate > 3%              → D++ (最大 8)
+prefetch_waste_rate > 40%    → D-- (最小 1)
+```
+
+### 22.8 帯域ガバナ — 投機とデマンドの調停
+
+```
+総帯域 BW を 3 種の I/O が奪い合う:
+  1. デマンドフェッチ (実行が待っている)     — 最優先
+  2. 高確度プリフェッチ (P0/P1、D≤2)          — 中
+  3. 低確度プリフェッチ (P2/P3、D≥3)          — 低
+
+配分ルール:
+  demand_share = 実測の miss 率から動的に確保 (最低 50%)
+  残りを 高確度 : 低確度 = 2 : 1 で配分
+
+★ デッドライン超過時 (§16.6 Level 1):
+  低確度プリフェッチを即座に停止し、全帯域をデマンドへ
+```
+
+**io_uring の優先度**: `IOSQE_IO_LINK` ではなく、
+**自前の優先度キューで提出順を制御する**方が確実。
+カーネル/デバイスの優先度機構 (`ioprio`) は NVMe では効果が限定的。
+
+さらに **in-flight 件数の上限を優先度別に持つ**:
+```
+urgent : 上限なし (最大 QD まで)
+high   : QD の 60% まで
+low    : QD の 25% まで
+```
+これにより低確度プリフェッチがキューを埋めてデマンドを遅延させる事故を防ぐ。
+
+### 22.9 プリフェッチのキャンセル
+
+予測が陳腐化した (実際の router 出力が違った) 場合:
+
+| 状態 | 対処 |
+|---|---|
+| QUEUED (未発行) | キューから削除。コストゼロ |
+| IN_FLIGHT | **キャンセルしない**。`IORING_OP_ASYNC_CANCEL` は成功率が低く、既に DMA 中なら無意味。完了させて SMALL 末尾に admit (将来使うかもしれない) |
+| slot を確保済 | 完了まで保持。free list へは返さない |
+
+**「発行したものは完了させる」という単純な規律**を採る。
+キャンセルの複雑性に見合う利得がない。
+
+### 22.10 予測器の重み学習
+
+```
+各予測器 i について、オンラインで以下を追跡:
+  hits_i   : その予測器が (単独で) 発行し、実際に使われた回数
+  issued_i : 発行回数
+  lead_i   : 平均有効リードタイム
+
+重み更新 (1,024 step ごと):
+  w_i ← w_i × (1 + η · (precision_i − mean_precision))
+  正規化: Σ w_i = 1
+```
+
+**これにより、モデル・ワークロードごとに最適な予測器の組合せが自動的に選ばれる。**
+Mixtral のような粗粒度 MoE では P1 (時間局所性) が強く、
+Qwen3.6 のような細粒度では P4 (セッションプロファイル) が強い、
+といった差が自動的に反映される。
+
+観測結果は `/metrics` と `moestream stats --predictors` で公開し、
+**MoE キャッシング研究のデータソースとして提供する** (P8)。
+
+---
+
+## 23. 非同期 I/O
+
+### 23.1 I/O パスの全体
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PL as Prefetch Planner
+    participant SU as IO Submitter
+    participant K as Kernel (io_uring)
+    participant N as NVMe
+    participant A as Host Arena
+    participant RP as IO Reaper
+    participant EM as Expert Manager
+
+    PL->>SU: ReadReq × 12 (優先度付き)
+    SU->>SU: 優先度順にソート、SQE 組立
+    Note over SU: fixed buffer index + registered fd<br/>→ get_user_pages 不要
+    SU->>K: io_uring_enter(submit=12)
+    K->>N: NVMe コマンド発行 (QD=12)
+    N->>A: ★ DMA 直接書込 (O_DIRECT)
+    Note over N,A: CPU コピー 0 回<br/>page cache 経由なし
+    N->>K: 完了割込
+    K->>RP: CQE (eventfd or busy-poll)
+    RP->>RP: req_id → ExpertId 逆引き
+    RP->>EM: state: IN_FLIGHT → RESIDENT_HOST
+    RP->>EM: MPSC リングへ完了通知
+```
+
+### 23.2 SQE 組立の最適化
+
+```
+1 SQE あたりの組立コストを最小化する:
+  ✓ registered buffer index を使う (アドレス変換不要)
+  ✓ registered file index を使う (fd 参照カウント不要)
+  ✓ iovec は事前計算済み (EXPERT_INDEX から直接、実行時計算なし)
+  ✓ user_data に (ExpertId, slot, generation) を packing
+     → 完了時のハッシュ引き不要
+
+user_data (u64) のレイアウト:
+  [63:48] generation (ABA 防止)
+  [47:32] slot_id
+  [31:16] expert_id
+  [15: 0] layer_id
+```
+
+**generation カウンタが重要**: プリフェッチをキャンセルして slot を再利用した後に
+古い CQE が来る可能性がある。generation で検出して破棄する。
+
+### 23.3 バッチ提出
+
+```
+Submitter は「溜めてから出す」:
+  条件 A: SQE が 8 個溜まった
+  条件 B: 最初の SQE から 50 µs 経過
+  条件 C: URGENT が 1 個でもある → 即提出
+
+→ syscall 回数を 1/8 に削減しつつ、緊急要求の遅延は増やさない
+```
+
+SQPOLL 有効時は条件 B/C が不要 (カーネルスレッドが自動で拾う)。
+
+### 23.4 バックプレッシャ
+
+```mermaid
+graph TB
+    A["in-flight 件数"] --> B{"QD 上限?"}
+    B -->|"未達"| C["提出"]
+    B -->|"到達"| D{"優先度は?"}
+    D -->|"URGENT"| E["low 優先度の未発行要求を捨てて<br/>枠を作る"]
+    D -->|"high"| F["キューで待機"]
+    D -->|"low"| G["★ 要求を破棄<br/>(投機なので捨ててよい)"]
+```
+
+**低優先度プリフェッチは「捨ててよい」**という性質が、
+バックプレッシャ設計を劇的に単純にする。
+キューが溢れたら黙って捨て、メトリクスに記録するだけでよい。
+
+### 23.5 IoGovernor (適応 QD 制御)
+
+```
+目標: 帯域を最大化しつつ p99 レイテンシを閾値以下に保つ
+
+  measure window = 256 完了
+
+  if p99_latency > target_p99 × 1.2:
+      qd_limit ← max(qd_limit × 0.8, qd_min)      # 乗算的減少
+  elif p99_latency < target_p99 × 0.8 and bw_util > 0.9:
+      qd_limit ← min(qd_limit + 4, qd_max)        # 加算的増加
+
+  target_p99 = t_layer × D / 2 = 1.0 ms × 4 / 2 = 2.0 ms
+```
+
+TCP 輻輳制御 (AIMD) と同型。
+**NVMe を飽和させすぎない**ことが p99 を守る鍵である。
+
+### 23.6 フォールバックバックエンド
+
+| バックエンド | 実装 | 性能 (対 io_uring) | 用途 |
+|---|---|---|---|
+| `io_uring` | 上述 | 100% | Linux 5.15+、既定 |
+| `pread_pool` | N スレッドが `pread`/`preadv` をブロッキング実行 | 80〜90% | io_uring 不可、macOS |
+| `aio` | POSIX AIO | 60〜75% | 参考実装のみ |
+| `mmap` | 別スレッドで touch → 完了通知 | 50〜70%、RAM 上限保証なし | デバッグ・参照実装 |
+
+**`pread_pool` の性能が意外に高い**ことに注意。
+スレッド 8 本で `preadv` を並列実行すれば、2 MiB 読出では
+syscall オーバーヘッドは相対的に小さい (2 MiB / 6 GB/s = 330 µs に対し syscall 1〜2 µs)。
+io_uring の真価は「小さい I/O を大量に」の場合であり、
+本ワークロードでは差が 10〜20% に留まる見込み。
+
+> **したがって io_uring は必須ではなく最適化である。**
+> これは移植性 (OR-1/OR-2) の観点で好都合であり、
+> Windows (IOCP) / macOS への展開障壁を下げる。
+> 初期実装は `pread_pool` から始めてよい (§34 の M1)。
+
+### 23.7 I/O エラーの扱い
+
+| エラー | 対処 |
+|---|---|
+| `EAGAIN` | 再提出 (キューフル) |
+| `EINTR` | 再提出 |
+| 短い読出 | 残りを再提出 (O_DIRECT では稀) |
+| `EIO` | 3 回リトライ → 失敗なら Expert を `FAILED` へ。`strict` ならリクエストをエラー、`soft` ならスキップして続行 + 警告 |
+| チェックサム不一致 | `POISONED` へ。以後その Expert は使わずスキップ。ログに CRITICAL。`--verify-on-load` 時のみ検査 |
+| ファイル削除/アンマウント | 全リクエストをエラーにし、デーモンは degraded 状態で待機 (再マウントで復帰) |
+
+---
+
+## 24. GPU 転送
+
+### 24.1 転送が必要なケース
+
+```mermaid
+graph TB
+    Q{"MemoryTopology?"} 
+    Q -->|UNIFIED| U["★ 転送不要<br/>arena を直接参照<br/>(§14.4)"]
+    Q -->|DISCRETE| D["Host Arena → VRAM<br/>転送が必要"]
+    Q -->|DISCRETE_BAR| B["小さい Expert は<br/>BAR 経由で直接読める<br/>大きいものは転送"]
+    style U fill:#22543d,color:#fff
+```
+
+**主要ターゲット (iGPU) では転送が存在しない。**
+本章は dGPU 環境のための設計である。
+
+### 24.2 dGPU での 2 段キャッシュ
+
+```
+NVMe ──readv──► Host Arena (Tier 1, pinned) ──async copy──► VRAM (Tier 0)
+                      7.6 GiB                                  可変
+```
+
+| 転送タイミング | 方式 |
+|---|---|
+| Tier 0 ミス & Tier 1 ヒット | 実行直前に非同期コピー。GEMM の依存に semaphore を張る |
+| Tier 0 昇格 (バックグラウンド) | 専用 transfer queue、計算とオーバーラップ |
+| Tier 1 ミス (SSD から) | SSD → Host → VRAM の 2 段。パイプライン化 |
+
+### 24.3 転送の秘匿
+
+```mermaid
+sequenceDiagram
+    participant CQ as Compute Queue
+    participant TQ as Transfer Queue
+    participant SEM as Timeline Semaphore
+
+    Note over CQ,TQ: 層 L を計算中に 層 L+1 の Expert を転送
+    par 並列
+        CQ->>CQ: 層 L の GEMM 実行
+    and
+        TQ->>TQ: 層 L+1 の expert × 8 を H2D コピー
+        TQ->>SEM: signal(value = L+1)
+    end
+    CQ->>SEM: wait(value = L+1)
+    CQ->>CQ: 層 L+1 の GEMM 実行
+```
+
+Vulkan では **transfer 専用キューファミリ**を使う (DMA エンジンが独立)。
+CUDA では専用 stream + `cudaMemcpyAsync`。
+
+**転送時間の見積り (dGPU, PCIe 4.0 x16 = 25 GB/s 実効)**:
+```
+8 expert × 1.992 MiB = 15.9 MiB / 25 GB/s = 0.64 ms
+層あたり計算時間 1.0 ms > 0.64 ms  → 完全に隠せる ✅
+```
+
+### 24.4 小転送のバッチ化
+
+8 個の Expert を個別にコピーすると、コマンド発行オーバーヘッドが効く。
+
+```
+対策: Host Arena 側で slot が連続していれば 1 回のコピーにまとめる
+      → slot 割当時に「同一層の Expert は連続 slot を優先」するヒントを入れる
+
+さらに: VRAM 側も slab 構造なので、
+      vkCmdCopyBuffer の regions[] に複数 region を渡して 1 コマンドで発行
+```
+
+### 24.5 pinned メモリの扱い
+
+dGPU では H2D コピーに page-locked メモリが必要 (でないとドライバが内部でバウンス)。
+
+| 選択肢 | 評価 |
+|---|---|
+| Arena 全体 (7.6 GiB) を pin | ⚠️ 32 GB マシンでは重い。ただし予算内なので許容範囲。**dGPU 時の既定** |
+| staging ring (256 MiB) のみ pin | 追加コピーが 1 回発生 (Arena → staging → VRAM)。帯域が半減 |
+| pin しない | ドライバのバウンスバッファ経由。最も遅い |
+
+**判断: dGPU 時は Arena を pin する。** `mlock` 相当のコストは起動時のみで、
+`--mem-budget` 内に収まっているので他プロセスを圧迫しない。
+pin 失敗時 (`RLIMIT_MEMLOCK`) は staging ring へフォールバックし、警告を出す。
+
+### 24.6 UMA 環境での注意点
+
+「転送が不要」なのは正しいが、**キャッシュコヒーレンシ**には注意が要る。
+
+```
+io_uring (DMA) が arena へ書き込む
+  → CPU キャッシュには入っていない
+  → iGPU が読む前に、必要なら cache flush / invalidate
+
+Vulkan: VK_MEMORY_PROPERTY_HOST_COHERENT_BIT があれば自動
+        なければ vkFlushMappedMemoryRanges が必要
+
+O_DIRECT DMA + host coherent memory の組合せでは、
+実測でコヒーレンシ問題が出る可能性があるため、
+初期実装では明示的に vkInvalidateMappedMemoryRanges を呼び、
+実測で不要と分かれば外す (慎重側に倒す)。
+```
+
+**これは実装時に慎重な検証が必要な箇所**として §32.5 に記録する。
+---
+
+## 25. API 設計
+
+### 25.1 API サーフェスの全体
+
+```mermaid
+graph LR
+    subgraph EXT["外部 API"]
+        O["OpenAI 互換 HTTP<br/>(移行コストゼロ)"]
+        N["MoEStream 拡張 HTTP<br/>(ストリーミング固有の制御)"]
+        A["Admin API<br/>(運用・観測)"]
+        U["UDS + SHM<br/>(同一マシン高速経路)"]
+    end
+    subgraph EMB["組込み API"]
+        C["C ABI (libmoestream)"]
+        R["Rust crate"]
+        P["Python バインディング"]
+    end
+    O --> CORE["Session Manager"]
+    N --> CORE
+    A --> CORE
+    U --> CORE
+    C --> CORE
+    R --> CORE
+    P --> C
+```
+
+### 25.2 OpenAI 互換 API
+
+| エンドポイント | 対応 | 備考 |
+|---|---|---|
+| `POST /v1/chat/completions` | ✅ 完全 (SSE 含む) | tools/function calling 含む |
+| `POST /v1/completions` | ✅ | |
+| `GET /v1/models` | ✅ | ロード済みモデル一覧 |
+| `POST /v1/embeddings` | ✅ | |
+| `POST /v1/responses` | v1.1 | |
+| `logprobs`, `n`, `stop`, `seed` | ✅ | `seed` は決定論保証 (QR-1) |
+
+**互換性の方針**: OpenAI SDK / LangChain / LlamaIndex / Aider / Cline 等が
+**設定変更のみ (base_url 差替) で動く**ことを CI で検証する
+(`tests/compat/` に主要クライアントの実呼び出しテストを置く)。
+
+### 25.3 MoEStream 拡張 (リクエスト単位)
+
+OpenAI の拡張フィールド規約に従い、`x_moestream` オブジェクトに閉じる。
+
+```json
+{
+  "model": "qwen3.6-35b-a3b",
+  "messages": [...],
+  "x_moestream": {
+    "quality_mode": "strict",          // strict | soft | turbo
+    "priority": "interactive",         // interactive | normal | batch
+    "deadline_ms": 30000,              // 全体のデッドライン
+    "tbt_target_ms": 50,               // 目標トークン間レイテンシ
+    "cache_hint": {
+      "domain": "code",                // hot set のドメイン選択
+      "affinity_group": "agent-swarm-1" // §26.4 の親和グループ
+    },
+    "session_id": "sess_abc123",       // KV 再利用のための明示セッション
+    "kv_retain_sec": 300               // 生成後も KV を保持する秒数
+  }
+}
+```
+
+**レスポンスヘッダ (P9 の実装)**:
+
+```
+X-MoEStream-Quality-Mode: soft
+X-MoEStream-Experts-Skipped: 3
+X-MoEStream-Skipped-Weight-Mass: 0.0071      ← スキップした重みの合計
+X-MoEStream-Cache-Hit-Rate: 0.782
+X-MoEStream-Bytes-Read: 148372480
+X-MoEStream-Stall-Ratio: 0.021
+X-MoEStream-Deterministic: false             ← strict なら true
+```
+
+**`X-MoEStream-Deterministic` が false のとき、
+利用者は「この出力は baseline と一致しない可能性がある」と明示的に知る。**
+これが P9 (近似は明示的) の API レベルでの実現である。
+
+### 25.4 管理 API
+
+| エンドポイント | 用途 |
+|---|---|
+| `GET /metrics` | Prometheus 形式 |
+| `GET /v1/internal/cache/stats` | ヒット率、セグメント別サイズ、層別クォータ |
+| `GET /v1/internal/cache/heatmap` | 全 Expert のアクセス統計 (研究用、CSV/Parquet) |
+| `POST /v1/internal/cache/pin` | 特定 Expert/層の手動 pin (実験用) |
+| `POST /v1/internal/cache/flush` | キャッシュ全消去 (ベンチマークのコールド計測用) |
+| `GET /v1/internal/sessions` | セッション一覧、KV 使用量、優先度 |
+| `POST /v1/internal/sessions/{id}/evict` | KV を SSD へ退避 |
+| `GET /v1/internal/predictors` | 予測器別の精度・リードタイム・重み |
+| `GET /healthz`, `GET /readyz` | 死活・準備完了 |
+
+**`/cache/heatmap` を第一級の API にする**のは、
+MoE キャッシング研究への貢献を意図している (P8, §35.7)。
+
+### 25.5 高速ローカル経路 (UDS + 共有メモリ)
+
+HTTP + JSON はトークンあたり数十 µs のオーバーヘッドがある。
+`tbt_target_ms = 20` のような厳しい要求では無視できない。
+
+```
+Unix Domain Socket で制御 (リクエスト開始/終了)
+  + 共有メモリリングでトークンをストリーム
+  + eventfd で通知
+
+  → トークンあたりのオーバーヘッドを ~1 µs へ
+```
+
+**適用対象**: 同一マシンで動く Agent フレームワーク。
+Python/Rust/Node のクライアントライブラリを提供する。
+HTTP は常に利用可能で、UDS はオプトインの最適化とする。
+
+### 25.6 C ABI (`libmoestream`)
+
+```c
+/* 概念のみ — 実際の宣言は実装フェーズで確定 */
+ms_context*  ms_init(const ms_config*);
+ms_session*  ms_session_create(ms_context*, const ms_session_config*);
+int          ms_session_feed(ms_session*, const int32_t* tokens, size_t n);
+int          ms_session_step(ms_session*, ms_step_result* out);
+void         ms_session_destroy(ms_session*);
+const ms_stats* ms_stats_get(ms_context*);
+void         ms_shutdown(ms_context*);
+```
+
+**設計方針**:
+- 不透明ポインタのみ。構造体の内部を公開しない (ABI 安定性)
+- 全関数がエラーコードを返す。例外・panic を境界で捕捉
+- コールバックは使わない (ポーリングモデル) — 言語バインディングが容易になる
+- スレッド安全: `ms_context` は共有可、`ms_session` は 1 スレッド専有
+
+### 25.7 CLI
+
+```
+moestream serve      --model x.msp --mem-budget 10GiB --port 8080
+moestream run        --model x.msp --prompt "..."          # 単発生成
+moestream pack       model.gguf -o model.msp [--calibrate corpus.txt]
+moestream calibrate  model.msp --corpus code.txt --tag code
+moestream doctor     [--model x.msp]                        # 環境診断 (§14.7)
+moestream bench      --model x.msp --suite standard         # §33
+moestream stats      --url http://localhost:8080            # 稼働中の観測
+moestream trace      --url ... --out trace.parquet          # Expert アクセストレース
+moestream verify     model.msp                              # チェックサム検証
+```
+
+---
+
+## 26. マルチ Agent 対応
+
+### 26.1 なぜマルチ Agent が第一級の要求なのか
+
+```
+Agent 3 体を独立プロセスで動かす場合:
+  llama.cpp × 3 = 22 GB × 3 = 66 GB   → 32 GB マシンでは不可能
+
+MoEStream デーモン 1 個:
+  RESIDENT 1.2 GB + Expert Cache 7.6 GB (共有)
+  + セッション固有 (KV 0.08 GB + GDN state 0.06 GB) × 3
+  = 9.2 GB                             → 余裕で動く
+```
+
+**「共有できるものは共有する」という当たり前のことを、
+プロセス境界を越えて実現するのがデーモンモデルの価値**である。
+
+さらに、Expert Cache の共有は **単なるメモリ節約以上の効果**を持つ:
+同種タスクの Agent は似た Expert を使うため、
+互いのアクセスがキャッシュを温め合う (constructive interference)。
+
+### 26.2 セッションモデル
+
+```mermaid
+classDiagram
+    class Session {
+        +id: SessionId
+        +priority: Priority
+        +quality_mode: QualityMode
+        +affinity_group: Option~String~
+        +kv_handle: KvHandle
+        +state_handle: StateHandle
+        +expert_profile: [u16; 10240]
+        +tokens: Vec~TokenId~
+        +sampling: SamplingParams
+        +deadline: Option~Instant~
+        +last_active: Instant
+    }
+    class KvHandle {
+        +blocks: Vec~BlockId~
+        +n_tokens: u32
+        +swapped_out: bool
+    }
+    class StateHandle {
+        +gdn_state: ArenaRegion
+        +size: usize
+    }
+    Session --> KvHandle
+    Session --> StateHandle
+```
+
+**セッション固有コスト (Qwen3.6, 8K ctx)**:
+| 項目 | サイズ |
+|---|---|
+| KV (10 attn 層, Q8) | 80 MiB |
+| GDN 状態 (30 層 × 2 MiB) | **60 MiB (文脈長非依存)** |
+| Expert プロファイル | 20 KiB |
+| トークン列・メタ | < 1 MiB |
+| **合計** | **≈141 MiB / session** |
+
+**GDN 状態の固定 60 MiB が、多数セッション時のボトルネックになる。**
+16 セッションで 960 MiB。これは予算に対して無視できない。
+→ §26.5 の退避戦略が重要になる。
+
+### 26.3 分離と共有の境界
+
+| リソース | 共有/分離 | 理由 |
+|---|---|---|
+| Expert Cache | **完全共有** | 読み取り専用。共有が全ての価値の源泉 |
+| RESIDENT 重み | **完全共有** | 同上 |
+| Embedding 行キャッシュ | **共有** | 同上 |
+| KV Cache | **完全分離** | セッション固有の状態 |
+| GDN 再帰状態 | **完全分離** | 同上 |
+| Expert プロファイル (P4) | **分離 + 集約** | 個別に持ち、Cache Manager が加重和で hot set を決める |
+| 較正統計 (freq_ema) | **共有** | 全セッションの活動を集約 |
+| サンプリング RNG | 分離 | 決定論のため |
+
+### 26.4 Expert-Affinity Batching ★
+
+**問題**: 異種タスクのセッションを同一バッチに入れると、
+Expert union が大きくなり I/O が増える。
+
+```
+セッション A (コード生成) の層 L の top-8: {12, 37, 91, 104, 150, 201, 233, 240}
+セッション B (コード補完)  の層 L の top-8: {12, 37, 88, 104, 150, 199, 233, 251}
+                                    → union = 11 (重複 5)
+
+セッション C (日本語要約)  の層 L の top-8: {5, 44, 76, 118, 163, 187, 210, 248}
+                                    → A ∪ C = 16 (重複 0)
+```
+
+**解決**: セッションの Expert プロファイル間の類似度で束ねる。
+
+```
+similarity(s1, s2) = cosine( profile_s1, profile_s2 )
+
+Scheduler は Step 構成時に:
+  1. 実行可能セッションを類似度でクラスタリング (簡易 greedy)
+  2. 同一クラスタを優先して 1 Step に束ねる
+  3. ただし公平性制約 (待ち時間上限) を破らない範囲で
+
+明示指定: x_moestream.cache_hint.affinity_group で
+          ユーザが親和グループを宣言することも可能
+```
+
+```mermaid
+graph TB
+    subgraph BAD["親和性を無視した場合"]
+        B1["Step 1: A + C<br/>union = 16 expert/層"]
+        B2["Step 2: B + D<br/>union = 15 expert/層"]
+        B3["合計 I/O: 31 × 40 × 2 MiB = 2.4 GiB"]
+    end
+    subgraph GOOD["Affinity Batching"]
+        G1["Step 1: A + B (コード)<br/>union = 11 expert/層"]
+        G2["Step 2: C + D (日本語)<br/>union = 12 expert/層"]
+        G3["合計 I/O: 23 × 40 × 2 MiB = 1.8 GiB<br/>★ 25% 削減"]
+    end
+    style GOOD fill:#22543d,color:#fff
+```
+
+**さらに時間軸での分離**: 異種セッションを時間的に分離することで、
+キャッシュのワーキングセットが小さくなり、ヒット率も上がる。
+ただしラウンドロビン間隔が長すぎると TBT が悪化するため、
+**「同一クラスタを最大 K step 連続実行してから切り替える」** 方式を採る (既定 K = 16)。
+
+> これは MoEStream 固有のスケジューリング最適化であり、
+> 従来の LLM サービングには存在しない次元 (Expert の局所性) を利用している。
+> §33.5 で単独の効果を測定する。
+
+### 26.5 KV/state の SSD 退避
+
+Agent ワークロードでは **「長いコンテキストを持つが、しばらく喋らない」** セッションが多い。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active
+    Active --> Idle: last_active > 30 s
+    Idle --> SwappingOut: メモリ圧迫 or idle > 300 s
+    SwappingOut: KV + GDN state を .swap ファイルへ<br/>(io_uring write)
+    SwappingOut --> SwappedOut
+    SwappedOut --> SwappingIn: リクエスト到着
+    SwappingIn: SSD → RAM (141 MiB)
+    SwappingIn --> Active
+    SwappedOut --> [*]: TTL 超過で破棄
+    Active --> [*]: 明示的な終了
+```
+
+**コスト分析**:
+```
+退避サイズ  : 141 MiB / session (8K ctx)
+書込時間    : 141 MiB / 5 GB/s = 28 ms
+復帰時間    : 141 MiB / 6 GB/s = 24 ms
+対する再計算 : 8K token の prefill = 20 GiB 読出 + 計算 ≈ 9 s
+
+→ 退避/復帰は再計算の 1/180 のコスト。圧倒的に有利 ✅
+```
+
+**同じ io_uring インフラを再利用する**ので実装コストが小さい。
+これは「Expert ストリーミングのために作った機構が、
+KV 管理にもそのまま効く」という設計上の相乗効果である。
+
+### 26.6 公平性と優先度
+
+| クラス | 用途 | スケジューリング |
+|---|---|---|
+| `interactive` | 人間が待っている UI | 最優先。TBT 目標を守る。preempt されない |
+| `normal` | 通常の Agent | 公平配分 |
+| `batch` | バックグラウンド処理 | 余剰資源のみ。積極的に preempt される |
+
+**公平性の指標**: セッションごとの「生成トークン数 / 経過時間」を追跡し、
+Step 構成時に最も遅れているセッションを優先する (deficit round-robin 的)。
+
+**優先度逆転の防止**: `batch` セッションが Expert を refcount で握っていると
+`interactive` が evict できない。
+→ refcount の保持時間を「1 層の実行時間」に限定する規律により、
+握りっぱなしを構造的に防ぐ。
+
+### 26.7 マルチ Agent 時の性能予測
+
+```
+セッション数 n に対する合計スループット:
+
+  I/O 律速でない領域 (n ≤ 4):
+    合計 tok/s ≈ n × single_tok_s × 0.9   (バッチ効率で若干のオーバーヘッド)
+
+  I/O が効いてくる領域 (n ≥ 8):
+    union の増大で bytes/token が増える (§2.4)
+    ただしキャッシュヒット率も上がる (ワーキングセット共有)
+    → 相殺して概ね sublinear に飽和
+
+PR-6 の目標: 4 セッションで単一の 2.5 倍以上
+```
+
+**この予測の検証**は §33.5 のマルチセッションベンチで行う。
+
+---
+
+## 27. エラー処理
+
+### 27.1 エラー分類
+
+```mermaid
+graph TB
+    E["エラー発生"] --> C{"分類"}
+    C --> T["Transient<br/>一時的"]
+    C --> D["Degraded<br/>機能低下"]
+    C --> F["Fatal (session)<br/>セッション致命"]
+    C --> P["Fatal (process)<br/>プロセス致命"]
+    T --> T1["自動リトライ<br/>例: EAGAIN, EINTR"]
+    D --> D1["機能を落として継続<br/>例: GPU 不可 → CPU,<br/>io_uring 不可 → pread"]
+    F --> F1["該当セッションのみエラー<br/>他は継続<br/>例: context 超過, OOM"]
+    P --> P1["安全に停止<br/>例: モデルファイル消失,<br/>arena 確保失敗"]
+```
+
+### 27.2 主要エラーと対処
+
+| エラー | 分類 | 対処 | ユーザへの表示 |
+|---|---|---|---|
+| Arena 確保失敗 | Fatal(P) | 起動失敗 | 必要量と利用可能量を明示、`--mem-budget` の調整を提案 |
+| HugePages 不可 | Degraded | THP → 4 KiB へフォールバック | 起動ログに警告 + 期待性能の下方修正 |
+| io_uring 不可 | Degraded | `pread_pool` へ | 警告 + 予想性能差 |
+| O_DIRECT 不可 (FS 非対応) | Degraded | バッファード I/O + `fadvise(DONTNEED)` | 警告 + RAM 上限が緩む旨 |
+| `VK_EXT_external_memory_host` 不可 | Degraded | staging コピー経路 | 警告 |
+| Vulkan デバイス消失 | Degraded → Fatal(P) | 再初期化を 3 回試行 → 失敗なら CPU backend へ、それも不可なら停止 | |
+| Expert I/O エラー (EIO) | Transient → Session | 3 リトライ → `strict` はセッションエラー、`soft` はスキップ | ヘッダで通知 |
+| チェックサム不一致 | Fatal(P) 相当 | Expert を POISONED、CRITICAL ログ。`--strict-integrity` なら即停止 | ファイル破損の可能性を明示、`verify` を促す |
+| KV 確保不能 | Session | Admission で拒否 (503) or 既存を退避 | `Retry-After` |
+| context 長超過 | Session | 400 エラー | 明確なメッセージ |
+| デッドライン超過 | Session | 部分結果を返す (`finish_reason: "deadline"`) | |
+| セッション数上限 | Session | 429 + `Retry-After` | |
+| モデルファイル消失/アンマウント | Fatal(P) | degraded 状態で待機、再マウントで自動復帰 | `/readyz` が false に |
+
+### 27.3 メモリ予算違反の扱い
+
+**予算違反は「起きたら報告する」ものではなく「起きないように設計する」もの** (P1)。
+
+```
+多層防御:
+  ① 設計: 全大領域が固定サイズブロック。動的成長する構造がない
+  ② 実装: Arena 外の大アロケーションを禁止する型システム上の規約
+          (大領域確保は MemoryGovernor 経由でしか行えない API 設計)
+  ③ 実行時: 定期的に RSS を読み、予算の 95% 超過で WARN、
+            105% 超過で新規 admission 停止 + CRITICAL ログ
+  ④ CI: soak テストで 72 時間 RSS を監視、単調増加を検出したら失敗
+```
+
+`③` は「起きるはずのないことが起きた」ことの検出であり、
+発生したら必ずバグとして扱う (自動的に GitHub issue テンプレートを出力する)。
+
+### 27.4 パニック/クラッシュ時の情報
+
+```
+クラッシュ時に自動生成する診断バンドル:
+  - doctor の出力 (環境情報)
+  - 直近 1,024 step のメトリクススナップショット
+  - Expert 状態機械のサマリ (状態別カウント)
+  - 直近の I/O エラー履歴
+  - Memory Governor の配分履歴
+  → ~/.cache/moestream/crash-<timestamp>.json
+
+「このファイルを issue に添付してください」と表示する。
+```
+
+### 27.5 グレースフルシャットダウン
+
+```
+SIGTERM 受信:
+  1. 新規リクエストの受付停止 (/readyz → false)
+  2. 実行中セッションの完了を待つ (最大 --shutdown-grace, 既定 30 s)
+  3. 較正統計 (freq_ema) を .calib へ書き戻し ★
+  4. Arena 解放、io_uring 破棄
+  5. 終了
+
+★ 3 が重要: 稼働中に蓄積した Expert 統計を保存することで、
+   次回起動時のウォームアップが改善される。
+```
+
+---
+
+## 28. ログ・メトリクス
+
+### 28.1 ログ設計
+
+| レベル | 用途 | 例 |
+|---|---|---|
+| `ERROR` | 対処が必要 | I/O エラー、チェックサム不一致 |
+| `WARN` | 性能低下・フォールバック | HugePages 不可、予算 95% 到達、ストール率高 |
+| `INFO` | 状態変化 | 起動完了、セッション開始/終了、hot set 再構成 |
+| `DEBUG` | 開発時 | Step ごとのバッチ構成、キャッシュ統計 |
+| `TRACE` | 詳細解析 | Expert ごとの acquire/release |
+
+**構造化ログ (JSON) を既定**とし、`--log-format=pretty` で人間可読に。
+`tracing` クレートによるスパン階層 (`request → step → layer → expert`)。
+
+### 28.2 Prometheus メトリクス
+
+```
+# ── マスター指標 (P2) ──────────────────────────────
+moestream_bytes_read_per_token          gauge    ★最重要
+moestream_stall_ratio                   gauge    ★PR-8
+moestream_tokens_per_second             gauge
+
+# ── キャッシュ ──────────────────────────────────
+moestream_cache_hit_total{tier,segment}          counter
+moestream_cache_miss_total{tier,reason}          counter
+moestream_cache_slots{state}                     gauge   # resident/pinned/free/inflight
+moestream_cache_evictions_total{segment}         counter
+moestream_cache_layer_quota{layer}               gauge
+moestream_cache_ghost_hits_total{layer}          counter
+
+# ── プリフェッチ ────────────────────────────────
+moestream_prefetch_issued_total{predictor}       counter
+moestream_prefetch_useful_total{predictor}       counter
+moestream_prefetch_wasted_total{predictor}       counter
+moestream_prefetch_lead_time_seconds{predictor}  histogram
+moestream_prefetch_depth                         gauge
+moestream_predictor_weight{predictor}            gauge
+
+# ── I/O ────────────────────────────────────────
+moestream_io_bytes_total{priority}               counter
+moestream_io_latency_seconds{priority}           histogram
+moestream_io_inflight{priority}                  gauge
+moestream_io_qd_limit                            gauge
+moestream_io_errors_total{kind}                  counter
+
+# ── メモリ ──────────────────────────────────────
+moestream_memory_bytes{region}                   gauge   # arena 内訳
+moestream_memory_budget_bytes                    gauge
+moestream_rss_bytes                              gauge
+
+# ── スケジューラ ────────────────────────────────
+moestream_sessions{state}                        gauge
+moestream_batch_size                             histogram
+moestream_step_duration_seconds{phase}           histogram
+moestream_ttft_seconds                           histogram
+moestream_tbt_seconds                            histogram  ★PR-5
+moestream_queue_depth                            gauge
+
+# ── 品質 (P9) ───────────────────────────────────
+moestream_experts_skipped_total{mode}            counter
+moestream_skipped_weight_mass_total              counter
+moestream_deterministic_requests_ratio           gauge
+```
+
+### 28.3 標準ダッシュボード
+
+Grafana ダッシュボード JSON をリポジトリに同梱する。最上段の 4 パネル:
+
+```
+┌──────────────────┬──────────────────┬──────────────────┬──────────────────┐
+│ bytes / token    │ stall ratio      │ cache hit rate   │ TBT p50/p99      │
+│   ★P2            │   ★PR-8          │   ★PR-7          │   ★PR-5          │
+│  148 MB  ▼12%    │  2.1%  ✅        │  78.2% ✅        │ 41/68 ms ✅      │
+└──────────────────┴──────────────────┴──────────────────┴──────────────────┘
+```
+
+**この 4 つが緑なら設計通り動いている**、という単純な判断基準を与える。
+
+### 28.4 Expert ヒートマップ (研究用出力)
+
+```
+moestream trace --out trace.parquet --duration 300s
+
+Parquet スキーマ:
+  timestamp_ns : u64
+  session_id   : u32
+  layer        : u16
+  expert       : u16
+  router_weight: f32
+  event        : enum { HIT, MISS, PREFETCH_HIT, EVICT, ADMIT, SKIP }
+  predictor    : u8    # プリフェッチの場合、どの予測器由来か
+  lead_time_ns : i64   # 有効リードタイム
+```
+
+**このトレースは MoE キャッシング研究における貴重なデータセットになる。**
+匿名化済みトレースを定期的に公開データセットとしてリリースし、
+「MoEStream Expert Trace Dataset」としてコミュニティに提供する (§35.7)。
+これは OSS プロジェクトとしての引力と、研究コミュニティとの接点を同時に作る。
+
+### 28.5 分散トレーシング
+
+OpenTelemetry (OTLP) をオプションでサポート。
+Agent フレームワークが既に OTel を使っている場合、
+**LLM 呼び出しの内部が Expert I/O レベルまで見える**ようになる。
+
+```
+span: chat_completion
+ ├─ span: prefill (2048 tok)
+ │   └─ span: expert_sweep (20 GiB read)
+ └─ span: decode
+     ├─ span: step[0]
+     │   ├─ span: layer[0..39]
+     │   └─ event: cache_miss(layer=12, expert=88, wait=0.6ms)
+     └─ ...
+```
+
+---
+
+## 29. ディレクトリ構成
+
+```
+moestream/
+├── README.md                      # §3.4 の 3 分岐を冒頭に
+├── LICENSE                        # Apache-2.0
+├── NOTICE
+├── CONTRIBUTING.md
+├── CODE_OF_CONDUCT.md
+├── SECURITY.md
+├── CHANGELOG.md
+├── rust-toolchain.toml
+├── Cargo.toml                     # workspace
+│
+├── crates/
+│   ├── moestream-core/            # ★ 依存最小、モデル名を含まない
+│   │   ├── src/
+│   │   │   ├── runtime/           # Execution Planner, Graph Builder
+│   │   │   ├── expert/            # Expert Manager, 状態機械, Slot Table
+│   │   │   ├── cache/             # Cache Manager, S3-FIFO, ghost, quota
+│   │   │   ├── prefetch/          # 予測器群と融合器
+│   │   │   ├── memory/            # Memory Governor, Arena, HugePages
+│   │   │   ├── kv/                # Paged KV, 再帰状態, swap
+│   │   │   ├── sched/             # Scheduler, admission, affinity
+│   │   │   └── telemetry/
+│   │   └── tests/
+│   │
+│   ├── moestream-spec/            # Model Spec 定義とパーサ (モデル名 OK)
+│   │   ├── src/
+│   │   └── specs/
+│   │       ├── qwen3_6_moe.toml
+│   │       ├── qwen3_moe.toml
+│   │       ├── mixtral.toml
+│   │       ├── deepseek_v3.toml
+│   │       └── glm4_moe.toml
+│   │
+│   ├── moestream-storage/         # Storage Backend 実装群
+│   │   └── src/{iouring,pread_pool,mmap,traits}.rs
+│   │
+│   ├── moestream-gpu/             # GPU Backend 抽象 + GGML ラッパ
+│   │   └── src/{traits,vulkan,cuda,rocm,metal,cpu}.rs
+│   │
+│   ├── moestream-ggml/            # GGML への薄い FFI ラッパ (vendored)
+│   │   ├── vendor/ggml/           # サブモジュールまたは vendoring
+│   │   └── src/
+│   │
+│   ├── moestream-format/          # .msp の読み書き、GGUF パーサ
+│   │   └── src/{msp,gguf,index,calib}.rs
+│   │
+│   ├── moestream-server/          # HTTP/SSE, UDS, admin
+│   │   └── src/{openai,extensions,admin,uds}.rs
+│   │
+│   ├── moestream-cli/             # serve/run/pack/calibrate/doctor/bench
+│   │
+│   ├── moestream-capi/            # C ABI (cdylib + staticlib)
+│   │   └── include/moestream.h
+│   │
+│   └── moestream-bench/           # ベンチハーネス (§33)
+│
+├── bindings/
+│   ├── python/                    # PyO3 or ctypes
+│   └── node/
+│
+├── specs/                         # 設計文書 (本書を含む)
+│   ├── DESIGN.md                  # ← 本書
+│   ├── adr/                       # Architecture Decision Records
+│   │   ├── 0001-target-model-class.md
+│   │   ├── 0002-rust-plus-ggml.md
+│   │   ├── 0003-positioning-vs-colibri.md
+│   │   ├── 0004-no-mmap-as-primary.md
+│   │   ├── 0005-expert-granularity.md
+│   │   ├── 0006-slot-table-id-remap.md
+│   │   ├── 0007-no-dynamic-plugin-abi.md
+│   │   ├── 0008-out-of-order-expert-exec.md
+│   │   ├── 0009-no-gpudirect-storage-v1.md
+│   │   ├── 0010-msp-format.md
+│   │   └── 0011-expert-physical-ordering.md
+│   ├── format/MSP_FORMAT.md       # .msp 形式仕様 (別プロジェクトが実装可能な粒度)
+│   └── findings/                  # 実測結果の公開 (§12.5, §21.5 の検証)
+│
+├── docs/
+│   ├── en/                        # 英語版 (§35.4)
+│   ├── quickstart.md
+│   ├── tuning.md                  # 環境別チューニングガイド
+│   ├── architecture-support.md    # 対応モデル一覧と追加方法
+│   └── research.md                # トレースデータセットの使い方
+│
+├── tests/
+│   ├── architecture/              # 依存規律・モデル名混入の検査 (§9.7)
+│   ├── concurrency/               # loom / tsan (§15.6)
+│   ├── compat/                    # OpenAI SDK 互換 (§25.2)
+│   ├── determinism/               # QR-1: bit-exact 検証
+│   └── soak/                      # 72h RSS 監視
+│
+├── bench/
+│   ├── suites/                    # standard / low-ram / multi-agent / cold
+│   └── results/                   # 公開ベンチ結果 (機種別)
+│
+├── grafana/moestream-dashboard.json
+├── docker/
+└── .github/workflows/
+```
+
+### 29.1 クレート分割の原則
+
+| 原則 | 具体 |
+|---|---|
+| `core` は誰にも依存しない | storage/gpu は trait 経由。実装クレートは上位で注入 |
+| `spec` だけがモデル名を知る | §9.7 の CI で強制 |
+| `format` は core に依存しない | `.msp` は独立したツールでも読める (仕様公開のため) |
+| `ggml` ラッパは 1 箇所 | 上流変更の影響を局所化 |
+| バイナリは薄い | `cli`/`server` はオーケストレーションのみ |
+
+---
+
+## 30. クラス設計
+
+### 30.1 実装言語の選択 (ADR-0002)
+
+**決定: Rust (コア) + C/C++ (GGML を FFI 経由で利用)**
+
+| 観点 | Rust | C++20 | 判定 |
+|---|---|---|---|
+| 並行性の安全性 | ✅ 所有権で lock-free 構造の誤りを型で防げる | ⚠️ 規律に依存 | **本設計の中核は「refcount 付き slot を複数スレッドが触る」であり、ここでの誤りは再現困難なバグになる。Rust の利得が最大化される領域** |
+| io_uring | ✅ `io-uring` crate が薄く成熟 | ✅ liburing | 引分 |
+| GGML 統合 | ⚠️ FFI が必要 (ただし C API は単純) | ✅ ネイティブ | C++ 有利だが、GGML の C API は関数 100 個程度で bindgen で足りる |
+| ビルド・配布 | ✅ cargo、単一バイナリ、クロスコンパイル容易 | ⚠️ CMake 地獄 | Rust 有利 |
+| コントリビュータ層 | ⚠️ llama.cpp コミュニティは C++ 中心 | ✅ | **C++ 有利。これは実質的なリスク** |
+| テスト (loom/miri) | ✅ 並行性の形式的検証が可能 | ❌ | Rust 有利 |
+| 起動時間・実行時オーバーヘッド | ✅ 同等 | ✅ | 引分 |
+
+**判断根拠**: 本プロジェクトの本質的難所は GEMM ではなく
+**「並行的なキャッシュ状態管理」** である。ここでのバグは
+「たまに 0.1% の確率で壊れた重みで推論する」という最悪の形で現れうる。
+Rust の型システムと `loom` による検証がこれを防ぐ価値は、
+C++ コントリビュータの参入障壁を上回ると判断する。
+
+**リスク緩和**: C ABI (`moestream-capi`) を第一級で提供し、
+C/C++ 側からの利用と、C++ で書かれたバックエンドの受入を容易にする。
+
+### 30.2 中核クラス図
+
+```mermaid
+classDiagram
+    class Runtime {
+        -adapter: Arc~ModelAdapter~
+        -expert_mgr: Arc~ExpertManager~
+        -cache: Arc~CacheManager~
+        -prefetch: Arc~PrefetchEngine~
+        -storage: Arc~dyn StorageBackend~
+        -gpu: Arc~dyn GpuBackend~
+        -governor: Arc~MemoryGovernor~
+        -scheduler: Scheduler
+        +step(batch: &StepPlan) StepResult
+    }
+
+    class ExpertManager {
+        -states: Box~[AtomicU8; N]~
+        -slots: Box~[AtomicU16; N]~
+        -refcounts: Box~[AtomicU16; N]~
+        -slab: SlabView
+        -completion_rx: Consumer~Completion~
+        +acquire(layer, ids) AcquireResult
+        +release(guard: SlotGuard)
+        +poll_arrivals() ArrivalIter
+        +remap_ids(ids) SlotIds
+    }
+
+    class AcquireResult {
+        +hits: SmallVec~SlotId, 8~
+        +pending: SmallVec~ExpertId, 8~
+        +guard: SlotGuard
+    }
+
+    class SlotGuard {
+        <<RAII>>
+        +slots: SmallVec~SlotId, 8~
+        note "Drop で refcount を必ず解放"
+    }
+
+    class CacheManager {
+        -pinned: PinnedSet
+        -small: FifoQueue
+        -main: FifoQueue
+        -ghost: GhostQueue
+        -quota: LayerQuota
+        -stats: ExpertStats
+        +on_hit(id)
+        +on_miss(id, origin) AdmitDecision
+        +evict_one(layer) Option~SlotId~
+        +rebalance_quota()
+        +rebuild_hot_set(profile)
+    }
+
+    class PrefetchEngine {
+        -predictors: Vec~Box~dyn Predictor~~
+        -weights: Vec~f32~
+        -queue: PriorityQueue~PrefetchReq~
+        -bw_governor: BandwidthGovernor
+        +on_router_result(layer, ids, weights)
+        +plan(horizon: u8) Vec~ReadReq~
+        +update_weights()
+    }
+
+    class Predictor {
+        <<interface>>
+        +predict(ctx: &PredCtx, layer, depth) SmallVec~(ExpertId, f32), 32~
+        +name() &str
+        +cost_hint() Cost
+    }
+
+    class MemoryGovernor {
+        -budget: u64
+        -arena: Arena
+        -allocations: [AtomicU64; N_REGION]
+        +request(region, bytes) Result~ArenaRegion~
+        +release(region: ArenaRegion)
+        +pressure() Pressure
+        +rebalance() Plan
+    }
+
+    class ModelAdapter {
+        <<interface>>
+        +layer_plan() &LayerPlan
+        +moe_descriptor(layer) Option~&MoeDesc~
+        +expert_locator(layer, expert) ExpertLocator
+        +capabilities() CapabilitySet
+    }
+
+    class StorageBackend {
+        <<interface>>
+        +submit(reqs) SubmitResult
+        +poll_completions(out, max) usize
+    }
+
+    class GpuBackend {
+        <<interface>>
+        +submit_graph(graph, deps) SubmitToken
+        +import_host_ptr(ptr, len) Option~DeviceBuffer~
+    }
+
+    Runtime --> ExpertManager
+    Runtime --> CacheManager
+    Runtime --> PrefetchEngine
+    Runtime --> MemoryGovernor
+    Runtime --> ModelAdapter
+    Runtime --> StorageBackend
+    Runtime --> GpuBackend
+    ExpertManager --> AcquireResult
+    AcquireResult --> SlotGuard
+    ExpertManager --> CacheManager
+    PrefetchEngine --> Predictor
+    CacheManager --> MemoryGovernor
+    Predictor <|.. TemporalPredictor
+    Predictor <|.. LayerLookaheadPredictor
+    Predictor <|.. CoActivationPredictor
+    Predictor <|.. SessionProfilePredictor
+    Predictor <|.. LearnedPredictor
+```
+
+### 30.3 主要な型の設計意図
+
+| 型 | 設計意図 |
+|---|---|
+| `SlotGuard` (RAII) | refcount の解放漏れを型で防ぐ。**Expert が evict されない期間を静的に保証する唯一の手段** |
+| `AcquireResult` | hit と pending を分けて返すことで、呼び出し側が「hit を先に処理する」自然な形になる (§11.5) |
+| `SmallVec<_, 8>` | top-k は高々 8〜16。ヒープ確保をホットパスから排除 |
+| `Box<[AtomicU8; N]>` | 密配列。ハッシュマップを使わない (§11.1) |
+| `Predictor` trait | プリフェッチ戦略の実験を容易にする。研究コントリビューションの受け皿 (§35.7) |
+| `ArenaRegion` | Governor が発行する「予算券」。これ無しに大領域を触れない |
+
+### 30.4 ホットパスにおける動的ディスパッチの排除
+
+```
+問題: dyn StorageBackend / dyn GpuBackend の仮想呼び出しが
+      トークンあたり数百回発生すると無視できない
+
+解決: 起動時に enum で単型化する
+      enum Storage { IoUring(IoUringBackend), PreadPool(PreadPoolBackend), Mmap(MmapBackend) }
+      → match の分岐予測は完璧に当たり、インライン化も効く
+      → trait はテスト用のモック注入にのみ使う
+
+Predictor は dyn のままでよい (層ごとに数回しか呼ばれない)
+```
+
+### 30.5 エラー型の階層
+
+```
+StorageError  ─┐
+CacheError    ─┼─► RuntimeError ─► SessionError ─► ApiError (HTTP)
+GpuError      ─┤
+MemoryError   ─┘
+
+各層で型が変わることで、
+「下位のエラーを上位がそのまま握りつぶす」ことを型システムが防ぐ。
+`thiserror` で定義し、`#[from]` は意図的な変換にのみ付ける。
+```
+---
+
+## 31. 将来拡張
+
+拡張は「本設計のどの抽象がそれを可能にするか」を明記する。
+抽象が用意されていない拡張は、その時点で設計変更が必要という警告である。
+
+### 31.1 投機的デコード (v1.2) — 最も効果が大きい拡張
+
+```
+小型 dense draft モデル (0.6B, 常駐 400 MiB) が k トークンを提案
+    ↓
+MoEStream が k+1 トークンを 1 Step で検証
+    ↓
+Expert union は 1 トークン時の 2〜3 倍程度で済む (§2.4 の d(B))
+    ↓
+受理率 60% なら 実効 tok/s が 2.2 倍、bytes/token が 45% 減
+```
+
+**fine-grained MoE における唯一の実効的な I/O 償却手段** (§2.4 の帰結 3)。
+必要な抽象: Scheduler が「1 Step に同一セッションの複数トークン」を扱えること
+→ **既に chunked prefill で実現済み**。追加コストは小さい。
+
+さらに MoEStream 固有の相乗効果:
+> draft モデルの hidden state は、target モデルの Expert 選択の
+> **優れた予測器 (P6)** になりうる。draft の走行が prefetch のリードタイムを生む。
+
+### 31.2 Expert 単位の重み共有 / LoRA (v2)
+
+```
+同一ベースモデルに対する複数の LoRA アダプタを、
+Expert Cache とは別の小さな領域に保持し、
+Slot Table と同様の仕組みで動的に適用する。
+
+必要な抽象: ExpertLocator が「ベース + デルタ」を返せること
+現設計では tier フィールドの拡張で表現可能。
+```
+
+### 31.3 CXL メモリ階層 (v2+)
+
+```
+現在: SSD (100 µs) ─ RAM (100 ns)  ← 3 桁のギャップ
+将来: SSD ─ CXL メモリ (300 ns) ─ RAM  ← 中間層
+
+CXL 接続の大容量メモリ (数百 GB) は
+「遅い RAM」として Tier 1.5 に自然に収まる。
+
+必要な抽象: キャッシュ階層が 3 段以上に一般化されていること
+→ 現設計は Tier 0/1/3 の 3 段。Tier 1.5 の挿入は
+  CacheManager のセグメント追加で対応可能。
+```
+
+### 31.4 複数モデルの同時保持 (v1.2)
+
+```
+用途: ルーティング (小モデルで判定 → 大モデルへ)、
+      A/B 比較、Draft + Target (§31.1)
+
+設計上の要点:
+  - Expert Cache はモデルごとに独立 slab (スロットサイズが違う)
+  - Memory Governor がモデル間の予算配分を管理
+  - LRU でモデル単位のアンロードも行う (--max-loaded-models)
+  - RESIDENT 部分だけ常駐させ、Expert Cache は 0 にする
+    「コールド待機モード」→ モデル切替が 0.3 s で可能
+```
+
+**「コールド待機モード」は MoEStream ならではの機能**である。
+21 GiB のモデルを 1.2 GiB のフットプリントで「いつでも使える状態」に保てる。
+
+### 31.5 LM Head の最適化 (v2)
+
+```
+現状: LM Head 636 MiB が常駐 (予算の 6.6%)
+
+案 A: vocab を頻度順にソートし、上位 32K だけ常駐、
+      残りは必要時のみ読出 (top-k サンプリングでは下位は滅多に必要ない)
+      → 636 MiB → 84 MiB。ただし logprobs の正確性に影響
+
+案 B: LM Head を低精度 (Q4) に落とす → 636 → 424 MiB。品質影響を測定
+
+案 C: 常に GPU 側 VRAM に置く (dGPU 環境)
+```
+
+案 A は「speculative sampling の閾値」と組み合わせると正確性を保てる可能性がある。
+研究要素として §33 で評価する。
+
+### 31.6 Ultra-Low-RAM モード (v1.1)
+
+```
+PCIe 5.0 環境 (12〜14 GB/s) では §2.3 より
+「キャッシュがほとんど無くても目標を達成できる」
+
+--profile ultra-low-ram:
+  Expert Cache = 1 GiB (512 slots)
+  RESIDENT + KV + 実行時 = 2.0 GiB
+  → 総 RAM 3.0 GiB で 35B MoE が 20 tok/s
+
+これは 8 GB RAM のマシンで 35B MoE が動くことを意味する。
+```
+
+**これは本設計の最も驚くべき帰結**であり、
+PCIe 5.0 の普及とともに主要なユースケースになりうる。
+実装は既存機構のパラメータ変更のみ (アーキテクチャ変更不要)。
+
+### 31.7 ネットワーク越しの Expert ストア (v3, 研究)
+
+```
+RDMA / NVMe-oF 経由で Expert を取得する Storage Backend。
+複数マシンで 1 つの Expert ストアを共有する。
+
+前提: 25 GbE (3 GB/s) 〜 100 GbE (12 GB/s)
+     → §2.3 の表がそのまま適用できる
+
+必要な抽象: StorageBackend trait はすでにネットワークを排除していない。
+実装するだけでよい。
+```
+
+### 31.8 プラットフォーム拡張
+
+| 対象 | 時期 | 必要な作業 |
+|---|---|---|
+| Windows ネイティブ | v2 | IOCP バックエンド、HugePages 相当 (Large Pages)、DirectStorage 評価 |
+| macOS (Metal) | v1.2 | `pread_pool` で動く。UMA なのでゼロコピーも自然 |
+| ROCm (dGPU) | v1.1 | GGML 経由でほぼそのまま |
+| CUDA | v1.1 | 同上 + Tier 0 VRAM キャッシュの最適化 |
+| Android / ARM SBC | v2 | UFS ストレージ (帯域 2 GB/s 程度) → Regime A 寄り。要再評価 |
+
+### 31.9 マルチモーダル (v2+)
+
+Vision encoder は dense で常駐が必要 (数百 MiB)。
+MoE 部分は本設計がそのまま使える。
+`ROW_LOOKUP` の抽象が画像パッチ埋め込みにも適用できる可能性がある。
+
+---
+
+## 32. 技術的課題
+
+**本章は「解決済みの課題」ではなく「未解決のリスク」を正直に列挙する。**
+OSS 設計文書として、これを書かないことは誠実でない。
+
+### 32.1 【最大リスク】Expert 活性化の歪みが不十分な可能性
+
+**リスク**: §21.5 で述べた通り、`s < 0.45` (歪みが弱い) の場合、
+38% のキャッシュでヒット率 56% に届かず、PR-2 を達成できない。
+
+Qwen3.6 は負荷分散補助損失 (係数 0.001) により
+**意図的に均等利用へ誘導されている**。これは我々に不利に働く。
+
+**測定計画**: §33.4 を M1 の最優先タスクとする。
+**PoC の最初の 2 週間でこの数値を出し、結果を公開する。**
+
+**もし歪みが不十分だった場合の対応策 (優先順)**:
+
+| # | 対策 | 期待効果 | コスト |
+|---|---|---|---|
+| 1 | **プリフェッチ精度の向上に全振り** | ヒット率が低くても、予測が当たれば「事前に載っている」= 実質ヒット。この場合 P3 (学習予測器) が必須になる | 中 |
+| 2 | **精度 Tier (§18.6)** で miss バイトを 40% 削減 | 実効帯域 1.6 倍 = 必要ヒット率 56% → 30% | 中 |
+| 3 | **`soft` モードを既定に**し、低重み Expert のスキップを許容 | demand バイト 25% 削減 | 品質 (QR-2 の範囲内) |
+| 4 | 目標を「20% 低下」から「35% 低下」へ改定 | — | 目標の後退 (最後の手段) |
+| 5 | 推奨 RAM 予算を 10 → 13 GiB へ | ヒット率 +12 pt 程度 | 目標の後退 |
+
+**重要**: 対策 1〜3 はいずれもアーキテクチャ変更を要さない。
+**本設計は、この最大リスクが顕在化しても構造的には破綻しない。**
+これは設計の頑健性として評価されるべき点である。
+
+### 32.2 セッション局所性 vs グローバル局所性
+
+グローバル頻度が平坦でも、**単一シーケンス内では強い局所性がある**
+というのが MoE-Infinity 系の観測である。しかしこれは
+「1 セッション」の話であり、**マルチセッションでは重ね合わせで平坦化する**可能性がある。
+
+```
+セッション 1 のホット集合 H1 (500 expert)
+セッション 4 のホット集合 H4 (500 expert)
+|H1 ∪ H2 ∪ H3 ∪ H4| は 2,000 か、それとも 800 か?
+```
+
+これが §26.4 (Affinity Batching) の効果を決める。
+**§33.5 で `|∪ Hi| / Σ|Hi|` を測定する。**
+
+### 32.3 io_uring + O_DIRECT + Vulkan host ptr import の組合せ検証
+
+3 つの機構を同時に使う構成は前例が少なく、以下が未検証:
+- 同じメモリ領域を io_uring registered buffer と Vulkan imported memory の
+  両方にできるか (仕様上は可能だが、ドライバ実装依存)
+- DMA 書込 → GPU 読出のキャッシュコヒーレンシ (§24.6)
+- HugePages との相互作用
+
+**緩和策**: M0 (§34) で **この 3 機構の結合を検証する最小スパイク**を最優先で実施する。
+失敗した場合は staging コピー経路 (性能 -10% 程度) へフォールバックする設計になっている。
+
+### 32.4 GGML API の変動への追従
+
+llama.cpp は活発に開発されており、GGML の内部 API は頻繁に変わる。
+
+**緩和策**:
+- 特定コミットに vendoring で固定 (`vendor/ggml/`)
+- ラッパを 1 クレートに閉じる (`moestream-ggml`)
+- 四半期ごとの計画的アップデートを開発サイクルに組み込む
+- 使用する API を最小化 (GEMM/mul_mat_id/attention/norm/rope のみ、
+  グラフ管理は自前) → 依存表面積を小さく保つ
+
+**代替案の保持**: 最悪の場合、必要なカーネルは 10 種類程度である。
+自前実装への移行も不可能ではない (ただし P6 に反するので最後の手段)。
+
+### 32.5 決定論の実際の達成可能性 (QR-1)
+
+bit-exact を主張するには以下が全て成立する必要がある:
+- GGML の同一カーネル・同一スレッド数・同一 reduce 順序
+- Expert の累積順序を固定 (§10.6 で設計済)
+- バッチ構成が結果に影響しない (`mul_mat_id` の行独立性)
+
+**未検証**: GGML の Vulkan バックエンドで、
+ワークグループサイズがバッチサイズに応じて変わる場合、
+浮動小数の縮約順序が変わる可能性がある。
+
+**緩和策**: `--deterministic` フラグでバッチサイズを固定 (パディング) する
+オプションを用意する。性能とのトレードオフになるが、
+**QR-1 を満たす経路が存在すること**が重要。
+CI では `--deterministic` 下で検証する。
+
+### 32.6 NVMe の熱による帯域低下
+
+```
+19 GiB を数秒で読む prefill を繰り返すと、
+コンシューマ NVMe は 70〜80 ℃ に達しサーマルスロットリングする。
+帯域が 6 GB/s → 2〜3 GB/s に落ちる。
+
+これは §2.3 の表で「必要ヒット率 74%」の行に相当し、
+性能が突然半減する。
+```
+
+**対策**:
+- 温度を `/sys/class/nvme/.../hwmon*/temp1_input` で監視
+- スロットリング検出時にメトリクス `moestream_storage_throttled` を立て、
+  ユーザに警告 (ヒートシンクの推奨)
+- IoGovernor が実効帯域の低下を検出して自動的に予測深度を調整
+- **`doctor` で持続読出テストを行い、スロットリング閾値を事前に測定**
+
+**この問題は既存の LLM ランタイムには存在しない、
+SSD ストリーミング固有の運用課題**である。ドキュメント化が重要。
+
+### 32.7 SSD の寿命
+
+読み取り専用なので **書込摩耗は発生しない** (KV swap のみ書込)。
+むしろ懸念は「読み取り妨害 (read disturb)」だが、
+現代の NVMe は内部で対処しており実用上問題にならない。
+
+**ただし KV swap は書込である**: 141 MiB/session の退避が頻発すると
+無視できない書込量になる。
+→ 退避の頻度を制限 (最短 30 s 間隔)、
+  `moestream_swap_bytes_written_total` を公開して可視化する。
+
+### 32.8 メモリ予算の実効性 (cgroup / コンテナ)
+
+```
+--mem-budget 10GiB と cgroup の memory.max が食い違うと、
+OOM Killer に殺される。
+
+対策:
+  - /sys/fs/cgroup/memory.max を読み、budget > limit × 0.85 なら警告
+  - budget 未指定時は cgroup limit × 0.8 を既定にする
+  - memory.high を利用した緩やかな圧力の検出
+```
+
+### 32.9 Vulkan iGPU バックエンドの成熟度
+
+GGML の Vulkan バックエンドは CUDA に比べて最適化が遅れており、
+特に量子化 GEMM のカーネル効率で差がある。
+iGPU + Vulkan での `t_c` が想定より大きい場合:
+- **良い方向にも働く** (I/O を隠しやすくなる)
+- しかし絶対性能 (tok/s) が目標に届かない
+
+**M1 で iGPU + Vulkan のベースライン性能を実測し、
+本設計の目標値 (25 tok/s) を実測に基づいて再設定する。**
+
+### 32.10 未解決の設計上の問い
+
+以下は本設計文書で結論を出していない。実装と測定を通じて決める。
+
+| # | 問い | 決定時期 |
+|---|---|---|
+| Q1 | PINNED 比率 α の最適値 | M2 (§33.4 の結果後) |
+| Q2 | 先読み深度 D の既定値 (適応制御の初期値) | M2 |
+| Q3 | 精度 Tier (§18.6) を既定にするか | M3 |
+| Q4 | `.msp` の物理配置は人気度順か層順か Z-order か | M2 (ADR-0011) |
+| Q5 | 層別クォータの適応が実際に効くか (均等配分との差) | M2 |
+| Q6 | Affinity Batching の実効利得 | M4 |
+| Q7 | 学習予測器 (P3) がヒューリスティック (P2) を上回るか | M4 |
+| Q8 | `soft` モードを既定にすべきか | M3 (品質測定後) |
+
+**これらを ADR として順次確定し、決定過程を公開する。**
+
+---
+
+## 33. ベンチマーク設計
+
+### 33.1 測定の原則
+
+| 原則 | 内容 |
+|---|---|
+| **常に baseline と対比する** | 絶対値でなく比率で報告。baseline = 同一マシン・同一 GGUF・同一 GGML backend の llama.cpp |
+| **コールド/ウォームを分離** | `/cache/flush` + `echo 3 > drop_caches` でコールド状態を作る |
+| **3 軸のフロンティアを示す** | (RAM, 速度, 品質) の 3 次元。単一の数値で語らない |
+| **再現可能にする** | 全ベンチをコンテナ + 固定シードで。`bench/results/` に環境情報とともにコミット |
+| **不利な結果も公開する** | §35.5 の規範 |
+
+### 33.2 ベンチスイート
+
+| スイート | 内容 | 主要指標 |
+|---|---|---|
+| `standard` | 単一セッション、ctx 4K、512 token 生成 | tok/s, RSS, hit rate, bytes/token |
+| `cold` | キャッシュ全消去からの TTFT + 最初の 128 token | TTFT, 立ち上がり曲線 |
+| `low-ram` | `--mem-budget` を 4/6/8/10/12/16 GiB で掃引 | RAM-速度フロンティア |
+| `multi-agent` | 1/2/4/8/16 セッション同時 | 合計 tok/s, TBT p99, セッション間公平性 |
+| `long-context` | ctx 4K/16K/64K/128K/256K | KV 圧力下での Expert Cache 縮退の影響 |
+| `prefill` | prompt 512/2K/8K/32K | TTFT, prefill tok/s, スイープ効率 |
+| `quality` | strict/soft/turbo × PPL/MMLU/HumanEval | 品質劣化の定量 |
+| `storage` | Gen3/Gen4/Gen5/SATA/RAID0 | §2.3 の理論表の検証 |
+| `predictor` | 予測器の on/off 組合せ | 各予測器の限界寄与 |
+| `soak` | 72 時間連続稼働 | RSS 安定性、メモリリーク |
+
+### 33.3 標準報告フォーマット
+
+```
+MoEStream Benchmark Report
+Model: Qwen3.6-35B-A3B Q4_K_M (.msp, calibrated: general)
+Machine: Ryzen 8845HS / Radeon 780M (Vulkan) / DDR5-5600 32GB / 990 PRO 2TB
+Commit: abc1234  Date: 2026-XX-XX
+
+┌─────────────────┬──────────┬───────────┬────────┐
+│ Metric          │ Baseline │ MoEStream │ Ratio  │
+├─────────────────┼──────────┼───────────┼────────┤
+│ Peak RSS        │ 22.3 GiB │  9.61 GiB │ 0.43 ✅│
+│ Decode tok/s    │   28.1   │   24.4    │ 0.87 ✅│
+│ TTFT (2K, warm) │  1.82 s  │   2.41 s  │ 1.32 ✅│
+│ TTFT (2K, cold) │  1.82 s  │   5.9 s   │ 3.24   │
+│ TBT p50 / p99   │ 35/39 ms │ 41/66 ms  │ p99/p50 = 1.61 ✅│
+│ PPL (WikiText2) │  6.412   │   6.412   │ 1.000 ✅ (strict)│
+├─────────────────┼──────────┼───────────┼────────┤
+│ Cache hit rate  │    —     │   78.2%   │        │
+│ bytes/token     │    —     │   142 MB  │        │
+│ Stall ratio     │    —     │    2.1%   │        │
+│ Prefetch useful │    —     │   71.4%   │        │
+└─────────────────┴──────────┴───────────┴────────┘
+```
+
+### 33.4 【最優先】Expert 活性化分布の測定
+
+**M1 の最初の成果物。§32.1 の最大リスクを解消する。**
+
+```
+測定内容:
+  1. 較正コーパス (code / ja / general / math) 各 100K token を forward
+  2. 全 10,240 expert の活性化頻度を記録
+  3. 以下を算出・可視化:
+     - Zipf パラメータ s (層ごと・全体)
+     - Miss Ratio Curve: キャッシュ率 f に対するヒット率 h(f)
+     - 層ごとのルーティングエントロピー
+     - セッション内 vs セッション間の分布の差
+     - 連続トークン間の expert 再利用率 (P1 予測器の上限性能)
+     - 層間共活性化の相互情報量 (P5 予測器の上限性能)
+     - 層 L の hidden から層 L+d の expert を予測する精度 (P2 の上限性能)
+
+出力: docs/findings/expert-distribution-qwen36.md
+      + 生データ (Parquet) を公開
+```
+
+**この測定は、本設計の全ての定量的主張の根拠になる。**
+かつ、MoE 研究コミュニティにとって独立した価値を持つ。
+
+### 33.5 マルチセッション干渉の測定
+
+```
+測定: n セッションの Expert ホット集合の和集合サイズ
+  |∪ Hi| / Σ|Hi|  を n = 1..16 で測定
+
+同種タスク (全て code) と異種タスク (code/ja/math 混在) で比較
+→ Affinity Batching の理論的上限利得が分かる
+```
+
+### 33.6 精度 Tier の評価 (§18.6)
+
+```
+tier 1 (Q2_K) を rank ≥ R の expert に適用したときの:
+  - PPL 変化 (R = 2048, 4096, 6144, 8192)
+  - miss バイト削減率
+  - 実効速度向上
+
+→ Q3 (§32.10) の決定材料
+```
+
+### 33.7 ベンチマークの CI 統合
+
+```
+PR ごと     : standard スイートを縮小版で実行、性能退行 5% 超で警告
+nightly     : 全スイート、結果を bench/results/ へ自動コミット
+release 前  : soak 72h + quality フルセット
+```
+
+**性能退行の自動検出**は、この種のプロジェクトでは必須である。
+キャッシュ・プリフェッチの変更は容易に退行を生む。
+
+---
+
+## 34. 開発ロードマップ
+
+```mermaid
+gantt
+    dateFormat YYYY-MM
+    axisFormat %Y-%m
+    title MoEStream 開発ロードマップ
+    section M0 検証
+        技術スパイク (io_uring+Vulkan+HugePages)  :m0a, 2026-08, 3w
+        Expert 分布測定 (§33.4)                    :m0b, 2026-08, 3w
+        Go/No-Go 判定                              :milestone, 2026-09, 0d
+    section M1 骨格
+        .msp 形式 + pack ツール                    :m1a, 2026-09, 4w
+        Model Adapter + Qwen3.6 Spec               :m1b, 2026-09, 3w
+        pread_pool backend + 単純 LRU              :m1c, 2026-10, 3w
+        Slot Table + ID Remap + 単一セッション生成   :m1d, 2026-10, 4w
+    section M2 中核
+        io_uring backend                           :m2a, 2026-11, 3w
+        S3-FIFO + PINNED + 層別クォータ             :m2b, 2026-11, 4w
+        到着順ディスパッチ                          :m2c, 2026-12, 3w
+        予測器 P0/P1/P4/P5 + 融合                   :m2d, 2026-12, 4w
+        Expert スイープ prefill                     :m2e, 2027-01, 2w
+    section M3 実用
+        Memory Governor + 予算保証                  :m3a, 2027-01, 3w
+        Paged KV + GDN state + swap                :m3b, 2027-02, 4w
+        Scheduler + continuous batching             :m3c, 2027-02, 4w
+        OpenAI 互換 API + SSE                       :m3d, 2027-03, 3w
+        品質モード (strict/soft/turbo)              :m3e, 2027-03, 2w
+    section M4 最適化
+        Vulkan zero-copy (host ptr import)          :m4a, 2027-04, 3w
+        予測器 P2/P3 + オンライン重み学習            :m4b, 2027-04, 4w
+        Affinity Batching                           :m4c, 2027-05, 3w
+        IoGovernor (適応 QD)                        :m4d, 2027-05, 2w
+    section M5 展開
+        DeepSeek/GLM/Mixtral Spec + 検証            :m5a, 2027-06, 4w
+        CUDA/ROCm/Metal backend                     :m5b, 2027-06, 4w
+        投機的デコード                              :m5c, 2027-07, 4w
+        v1.0 リリース                               :milestone, 2027-08, 0d
+```
+
+### 34.1 マイルストーン受入基準
+
+| M | 名称 | Exit Criteria |
+|---|---|---|
+| **M0** | 技術検証 | ① io_uring O_DIRECT で arena へ直接 DMA でき、同じ arena を Vulkan から読める<br/>② Expert 活性化分布を測定し、`h(0.38) ≥ 0.50` を確認 (未達なら §32.1 の対策を採用して目標を再設定)<br/>**③ Go/No-Go を公開判断する** |
+| **M1** | 動く骨格 | 単一セッションで Qwen3.6 の生成が正しく完了。RSS ≤ 12 GiB。速度は問わない。QR-1 の bit-exact を達成 |
+| **M2** | ストリーミング中核 | PR-7 (hit ≥ 70%)、PR-8 (stall ≤ 15%)、PR-2 (≥ 70% of baseline) を達成 |
+| **M3** | 実用ランタイム | PR-1 (RSS ≤ 10 GiB)、PR-6 (4 session)、OpenAI SDK で動く。**アルファ公開** |
+| **M4** | 目標性能 | PR-2 (≥ 80%)、PR-5 (p99/p50 ≤ 2.0)、PR-8 (≤ 5%)。**ベータ公開** |
+| **M5** | 汎用化 | 4 アーキテクチャ以上、3 GPU backend 以上。**v1.0** |
+
+### 34.2 M0 の Go/No-Go 判断基準
+
+**本プロジェクトで最も重要な意思決定点。**
+
+```
+GO 条件 (全て満たす):
+  ✓ io_uring + O_DIRECT + Vulkan host ptr import が
+    少なくとも 1 つの実機構成で動作
+    (不可なら staging 経路で -10% を許容して GO)
+  ✓ h(0.38) ≥ 0.50
+    (未達なら §32.1 の対策 1〜3 を織り込んだ上で再評価)
+  ✓ iGPU + Vulkan での baseline tok/s ≥ 15
+    (これを下回ると絶対性能が実用に届かない)
+
+NO-GO / 方針転換の条件:
+  ✗ h(0.38) < 0.30 かつ 予測器 P2 の精度 < 50%
+    → キャッシュもプリフェッチも効かない。設計の前提が崩れる。
+      この場合、「RAM 削減率を 30% 程度に下げた保守的な設計」へ縮小するか、
+      プロジェクトを中止する。
+```
+
+**この基準を事前に公開しておくことが、
+OSS プロジェクトとしての誠実さの証明になる** (§35.5)。
+
+### 34.3 各マイルストーンでのリスク
+
+| M | 主要リスク | 緩和 |
+|---|---|---|
+| M0 | 3 機構の結合が動かない | staging 経路のフォールバック設計を先に用意 |
+| M1 | GGML の `mul_mat_id` が slot table 方式に適合しない | M0 で小規模検証を含める |
+| M2 | 予測器の精度が出ない | 複数予測器の融合と適応重みで冗長性を確保 |
+| M3 | メモリ予算が守れない (断片化等) | §17.5 の固定ブロック設計 + soak テスト |
+| M4 | Vulkan の挙動がドライバごとに違う | 主要 3 ドライバ (RADV/ANV/proprietary) で CI |
+| M5 | 他アーキで Adapter が破綻 | M1 の時点で Mixtral も動かして抽象を検証 |
+
+**M1 で 2 アーキテクチャ (Qwen3.6 + Mixtral) を動かす**のが重要。
+1 つだけで抽象を作ると必ず漏れる。
+
+---
+
+## 35. OSS 公開を前提とした設計指針
+
+### 35.1 ライセンスと知的財産
+
+| 対象 | ライセンス | 理由 |
+|---|---|---|
+| MoEStream 本体 | **Apache-2.0** | 特許条項があり企業採用の障壁が低い。Colibri と同じ |
+| GGML (vendored) | MIT (上流のまま) | 互換性あり |
+| `.msp` 形式仕様 | **CC0 / パブリックドメイン** | 他実装が自由に読み書きできるべき |
+| 較正データ・トレース | **CC-BY-4.0** | 研究利用を促進 |
+| ドキュメント | CC-BY-4.0 | |
+
+**`.msp` 形式を CC0 にするのは戦略的判断**である。
+llama.cpp や他のランタイムが `.msp` を読めるようになれば、
+フォーマットがエコシステムの共通資産になり、
+MoEStream 自体の価値も上がる (P10 の外部化)。
+
+### 35.2 ガバナンス
+
+```
+v1.0 まで      : BDFL (作者) モデル。方向性の一貫性を優先
+v1.0 以降      : メンテナ 3 名以上の合議。ADR に対する拒否権を持つ
+主要な決定     : 全て ADR として公開。issue で議論してからマージ
+破壊的変更     : semver に従う。1.x では .msp 形式の後方互換を維持
+```
+
+### 35.3 設計文書の規律
+
+| 規律 | 内容 |
+|---|---|
+| **ADR 必須** | アーキテクチャに影響する決定は `specs/adr/` に記録。「なぜそうしなかったか」を必ず書く |
+| **測定可能な要求のみ** | 受入基準を書けない要求は要求にしない (§4 の冒頭) |
+| **本設計書は生きた文書** | 実測で前提が覆ったら更新し、変更履歴を残す |
+| **未解決を隠さない** | §32 のような章を必ず維持する |
+
+### 35.4 ドキュメント
+
+```
+docs/
+  README.md            : 3 分岐 (§3.4) を冒頭に。5 分で価値が分かる
+  quickstart.md        : 10 分で動かせる
+  tuning.md            : 環境別 (RAM/SSD/GPU) のチューニング表
+  architecture-support.md : 対応モデル一覧 + 追加手順
+  research.md          : トレースデータの使い方、再現手順
+  en/                  : 全て英語版を用意 (第一級)
+```
+
+**言語方針**: 設計文書 (本書) は日本語で書かれているが、
+**v1.0 までに英語版を第一級ドキュメントとして整備する**。
+国際的な OSS として展開するには英語が必須であり、
+日本語版は「原典」として維持する二言語体制とする。
+
+### 35.5 誠実性の規範 ★
+
+このプロジェクトが守るべき文化的規範を明文化する。
+
+| 規範 | 具体 |
+|---|---|
+| **不利な結果を公開する** | ベンチで負けたら公開する。§32.1 のリスクを README から隠さない |
+| **他プロジェクトへ送客する** | §3.4 の 3 分岐を README 冒頭に。ユーザの利益を自プロジェクトの成長より優先 |
+| **理論値と実測値を区別する** | 本書の数値は「モデル構成からの計算値」であり実測ではないことを明示 |
+| **Go/No-Go 基準を事前公開** | §34.2。うまくいかなかった場合の撤退基準を先に示す |
+| **競合を正確に説明する** | Colibri の説明を推測で書かない。不確かなら「未確認」と書く (§3 の冒頭注記) |
+| **性能主張には再現手順を添える** | 全ベンチが `moestream bench` で再現可能 |
+
+**この規範自体をリポジトリの `PRINCIPLES.md` に置く。**
+技術的優位性より、この規範がプロジェクトの長期的な信頼を作る。
+
+### 35.6 コミュニティ設計
+
+| 施策 | 目的 |
+|---|---|
+| `Predictor` trait をプラグイン可能に | 研究者が新しい予測器を試せる。論文の実装先になる |
+| Expert トレースデータセットの公開 | MoE キャッシング研究のベンチマークになる |
+| `good first issue` の整備 | Model Spec の追加、ベンチの機種追加は参入しやすい |
+| 対応モデル表を README に | コミュニティが Spec を追加するインセンティブ |
+| 月次の開発ログ | 進捗と失敗を公開。§35.5 の実践 |
+| Discord / Matrix | 実機環境の多様性 (SSD/GPU) が価値なので、ユーザ報告を集める |
+
+### 35.7 研究コミュニティとの接点
+
+MoEStream は **「MoE キャッシング研究の実験プラットフォーム」** としての
+価値を明示的に狙う。
+
+```
+研究者への提供物:
+  1. Expert アクセストレース (実ワークロード)
+  2. Predictor trait による手法の実装先
+  3. 再現可能なベンチマークハーネス
+  4. Miss Ratio Curve 測定ツール
+
+見返り:
+  最新の予測手法・置換アルゴリズムが本体に還流する
+```
+
+論文で提案された手法 (ProMoE, Klotski, LayerScope, FineMoE, MoE-SpeQ 等) を
+**プラグインとして実装し、同一条件で比較する**ことは、
+研究コミュニティにとっても価値がある (現状、各論文が異なる環境で評価されている)。
+
+### 35.8 CI / 品質ゲート
+
+```
+必須ゲート (マージ条件):
+  ✓ fmt / clippy (deny warnings)
+  ✓ 単体テスト
+  ✓ アーキテクチャテスト (§9.7 モデル名混入、依存循環)
+  ✓ loom による並行性検証 (§15.6)
+  ✓ 決定論テスト (QR-1)
+  ✓ 性能退行チェック (standard スイート縮小版、-5% で警告)
+
+nightly:
+  ✓ 全ベンチスイート
+  ✓ ThreadSanitizer / Miri
+  ✓ 複数 GPU ドライバ (RADV / ANV / NVIDIA)
+  ✓ 複数カーネル (5.15 / 6.1 / 6.8 / 6.12)
+
+release:
+  ✓ soak 72h
+  ✓ 品質フルセット (PPL / MMLU / HumanEval)
+  ✓ 4 アーキテクチャの動作確認
+```
+
+### 35.9 セキュリティ
+
+| 項目 | 方針 |
+|---|---|
+| 攻撃面 | HTTP API (認証は逆プロキシに委譲するが、`--api-key` は提供)、モデルファイルのパース |
+| モデルファイルの信頼性 | `.msp`/GGUF のパースを fuzzing (`cargo-fuzz`)。**信頼できないモデルファイルを読むことを想定した堅牢性**が必要 |
+| メモリ安全性 | Rust により大部分は保証。`unsafe` ブロックには必ず安全性の議論をコメントで記述し、CI で `unsafe` の総数を追跡 |
+| DoS | Admission control (§16.5) がリソース枯渇を防ぐ。リクエストサイズ上限 |
+| 脆弱性報告 | `SECURITY.md` に private disclosure の窓口。90 日の開示ポリシー |
+
+### 35.10 名称について
+
+`MoEStream` は説明的で良いが、以下を検討に値する:
+
+| 候補 | 評価 |
+|---|---|
+| **MoEStream** | 明快。ただし "stream" は動画配信を連想させる可能性 |
+| **Kasumi** (霞) | 「実体はあるが軽い」の含意。日本発 OSS としての識別性 |
+| **Tsumugi** (紡ぎ) | Expert を紡ぐ含意 |
+| **Sieve** | 篩。必要なものだけ通す |
+
+**推奨: `MoEStream` を維持する。**
+検索性と説明不要性は、初期の OSS にとって最も価値がある。
+既存の同名プロジェクトが無いことを確認した上で確定すること。
+
+---
+
+## Appendix A: 記号表と解析モデル
+
+### A.1 記号
+
+| 記号 | 意味 | Qwen3.6-35B-A3B での値 |
+|---|---|---|
+| `L` | 層数 | 40 |
+| `E` | 層あたり routed expert 数 | 256 |
+| `k` | top-k | 8 |
+| `s_E` | Expert 1 体のバイト数 (Q4_K_M) | 1.945 MiB (ディスク上 2 MiB) |
+| `N` | 総 Expert 数 = `L × E` | 10,240 |
+| `B_act` | 1 token あたり active expert bytes = `L·k·s_E` | 622.4 MiB = 652.7 MB |
+| `BW` | SSD 実効帯域 | 6.0 GB/s (Gen4 想定) |
+| `t_c` | フル RAM 時の 1 token 計算時間 | 40 ms (想定) |
+| `h` | Expert Cache ヒット率 | 目標 ≥ 70% |
+| `S` | キャッシュスロット数 | 3,908 (7.6 GiB) |
+| `f` | キャッシュ率 = `S/N` | 38.2% |
+| `B` | バッチ内トークン数 | 1〜512 |
+| `d(B)` | 層あたり相異なる expert 数 | `E(1−(1−k/E)^B)` (一様仮定) |
+| `D` | プリフェッチ先読み層数 | 4 (適応) |
+| `σ` | ストール率 | 目標 ≤ 5% |
+
+### A.2 主要な式
+
+**(1) 1 token あたり I/O バイト数**
+```
+I(h, B) = L · d(B) · s_E · (1 − h) / B
+```
+
+**(2) 1 step の所要時間 (完全オーバーラップ時)**
+```
+t_step = max( t_c ,  I(h,B) · B / BW ) + t_stall
+```
+
+**(3) 目標達成条件 (速度低下 ≤ γ)**
+```
+I(h,1) / BW ≤ (1 + γ) · t_c
+⟺ h ≥ 1 − (1 + γ) · t_c · BW / B_act
+```
+γ=0.2, t_c=40 ms, BW=6 GB/s, B_act=652.7 MB → **h ≥ 0.559**
+
+**(4) 必要プリフェッチ深度**
+```
+D ≥ (I/O レイテンシ p99 + キュー待ち) / t_layer
+  = (1.0 ms + 0.2 ms) / 1.0 ms = 1.2  → 安全率込みで D = 4
+```
+
+**(5) 必要 in-flight バイト数**
+```
+Q_bytes = BW · D · t_layer = 6 GB/s × 4 × 1.0 ms = 24 MB
+QD = Q_bytes / s_E ≈ 12  → バースト対応で 64
+```
+
+**(6) キャッシュ率とヒット率 (Zipf 近似)**
+```
+h(f) ≈ f^(1−s)     (s: Zipf パラメータ, 0 < s < 1)
+```
+**この式は §33.4 の実測で置き換えられるべき暫定モデルである。**
+
+### A.3 レジーム判定
+
+```
+Regime = A  if  B_act / BW > t_c        (I/O 律速)
+         B  if  B_act / BW ≤ t_c         (計算律速に到達可能)
+
+Qwen3.6-35B-A3B @ 6 GB/s:  652.7/6000 = 0.109 s vs t_c = 0.040 s
+  → コールドでは A、h ≥ 63.2% で B へ遷移
+GLM-5.2-744B  @ 6 GB/s:    11000/6000 = 1.83 s vs t_c ≈ 0.15 s
+  → 常に A (h = 97% でようやく B。370 GB 中 10 GB では不可能)
+```
+
+---
+
+## Appendix B: Qwen3.6-35B-A3B 実数値表
+
+> 出典: HuggingFace `Qwen/Qwen3.6-35B-A3B` の `config.json`
+> (2026-08 時点)。派生値は本書での計算。
+
+### B.1 アーキテクチャ
+
+| 項目 | 値 |
+|---|---|
+| `num_hidden_layers` | 40 |
+| 層構成 | `[linear_attn, linear_attn, linear_attn, full_attn] × 10` |
+| `hidden_size` | 2,048 |
+| `vocab_size` | 248,320 |
+| `num_attention_heads` | 16 |
+| `num_key_value_heads` | 2 |
+| `head_dim` | 256 |
+| `num_experts` | 256 |
+| `num_experts_per_tok` | 8 |
+| `moe_intermediate_size` | 512 |
+| `shared_expert_intermediate_size` | 512 |
+| `linear_num_value_heads` | 32 |
+| `linear_num_key_heads` | 16 |
+| `linear_key_head_dim` | 128 |
+| `linear_value_head_dim` | 128 |
+| `linear_conv_kernel_dim` | 4 |
+| `tie_word_embeddings` | false |
+| 全 attention 層数 | 10 |
+| 全 GDN 層数 | 30 |
+
+### B.2 Expert オブジェクトのサイズ
+
+| 要素 | 要素数 | 量子化 | バイト数 |
+|---|---:|---|---:|
+| `ffn_gate` (2048 × 512) | 1,048,576 | Q4_K (144 B/256) | 589,824 = 576 KiB |
+| `ffn_up` (2048 × 512) | 1,048,576 | Q4_K | 589,824 = 576 KiB |
+| `ffn_down` (512 × 2048) | 1,048,576 | Q6_K (210 B/256) | 860,160 = 840 KiB |
+| **Expert 1 体** | 3,145,728 | Q4_K_M | **2,039,808 B = 1.945 MiB** |
+| ディスク上 (2 MiB アライン) | — | — | 2,097,152 B = 2.0 MiB |
+
+### B.3 メモリ・I/O 派生値
+
+| 項目 | 値 |
+|---|---|
+| Routed expert 総サイズ | 10,240 × 1.945 MiB = **19.45 GiB** |
+| ディスク上 (`.msp`) | 10,240 × 2 MiB = **20.0 GiB** |
+| 1 token の active expert bytes | 40 × 8 × 1.945 MiB = **622.4 MiB** |
+| Shared expert 総サイズ | 40 × 1.945 MiB = 77.8 MiB |
+| KV per token (10 attn 層, FP16) | 10 × 2 × 2 × 256 × 2 B = **20 KiB** |
+| KV per token (Q8) | **10 KiB** |
+| KV @ 8K ctx (Q8) | 80 MiB |
+| KV @ 32K ctx (Q8) | 320 MiB |
+| KV @ 256K ctx (Q8) | 2.5 GiB |
+| GDN 状態 / 層 (FP32) | 32 × 128 × 128 × 4 B = **2 MiB** |
+| GDN 状態 / session | 30 × 2 MiB = **60 MiB (文脈長非依存)** |
+| Embedding (in, Q4_K) | 248,320 × 2048 × 0.5625 B = 546 MiB → **ROW_LOOKUP で 0** |
+| LM Head (Q6_K) | 248,320 × 2048 × 0.8203 B = **636 MiB** |
+| 1 行の Embedding | 2048 weights = 8 × 144 B = **1,152 B** |
+
+### B.4 §2.4 の `d(B)` 計算値 (E=256, k=8)
+
+| B | `d(B)` | 層 I/O (MiB) | token I/O (MiB) |
+|---:|---:|---:|---:|
+| 1 | 8.00 | 15.6 | 15.56 |
+| 2 | 15.75 | 30.6 | 15.32 |
+| 4 | 30.52 | 59.4 | 14.84 |
+| 8 | 57.99 | 112.8 | 14.10 |
+| 16 | 105.0 | 204.3 | 12.77 |
+| 32 | 176.2 | 342.8 | 10.71 |
+| 64 | 231.4 | 450.2 | 7.03 |
+| 128 | 253.2 | 492.6 | 3.85 |
+| 256 | 255.9 | 497.9 | 1.95 |
+
+---
+
+## Appendix C: 用語集
+
+| 用語 | 定義 |
+|---|---|
+| **Expert** | MoE 層における 1 つの FFN。本設計における I/O とキャッシュの最小単位 |
+| **Slot** | Host Arena 上の Expert 1 体分の固定サイズ領域 |
+| **Slot Table** | `(layer, expert) → slot` の写像。GGML への ID Remap に使う |
+| **Slab** | 同一メンバ (gate/up/down) の全 slot を束ねた連続領域。GGML の 3D テンソルとして見せる |
+| **`.msp`** | MoEStream Pack。ストリーミング最適化されたモデルコンテナ形式 |
+| **Residency クラス** | テンソルを RESIDENT / STREAMED / ROW_LOOKUP / DEVICE_ONLY に分類したもの |
+| **到着順ディスパッチ** | Expert を I/O 完了順に GEMM する実行方式 (§11.5) |
+| **Expert スイープ** | prefill 時に全 Expert を逐次読出する戦略 (§20.2) |
+| **PINNED セット** | 較正統計に基づき evict されない Expert 集合 |
+| **ゴーストリスト** | 追い出した Expert の ID のみを保持するキュー。層別クォータ調整に使う |
+| **有効リードタイム** | プリフェッチ発行から実際に必要になるまでの時間 |
+| **ストール率** | I/O 待ちで計算が止まった時間 / 総時間 |
+| **Regime A / B** | I/O 律速 / 計算律速に到達可能な領域 (§2.2) |
+| **`B_act`** | 1 token あたりの active expert bytes。本設計の支配変数 |
+| **Affinity Batching** | Expert プロファイルが近いセッションを同一バッチへ束ねる (§26.4) |
+| **Memory Governor** | 全メモリ予算の配分権威 |
+| **GDN** | Gated DeltaNet。線形 attention の一種。固定サイズの再帰状態を持つ |
+| **UMA** | Unified Memory Architecture。iGPU で RAM と VRAM が同一 |
+
+---
+
+## Appendix D: 設計判断記録 (ADR) インデックス
+
+| ADR | 判断 | 節 |
+|---|---|---|
+| 0001 | ターゲットを 30〜70B MoE (`B_act ≤ 1.5 GB/token`) に限定する | §2.5, §5.1 |
+| 0002 | Rust コア + GGML (FFI) を採用する | §30.1 |
+| 0003 | Colibri とは補完関係とし、README で送客する | §3.4 |
+| 0004 | mmap + page cache を主機構にしない | §13.2 |
+| 0005 | キャッシュ粒度を Expert 単位とする | §5.2, §21.4 |
+| 0006 | Slot Table + ID Remap で GGML カーネルを無改造利用する | §10.4 |
+| 0007 | v1 では動的プラグイン ABI を提供しない | §9.6 |
+| 0008 | Expert を到着順に実行する (順序独立性の利用) | §11.5 |
+| 0009 | v1 では GPUDirect Storage を採用しない | §13.7 |
+| 0010 | `.msp` 独自コンテナを導入する (GGUF 直読みも維持) | §13.6, §18 |
+| 0011 | Expert の物理配置を人気度順とする (要検証) | §18.3 |
+| 0012 | 決定論を既定とし、近似はオプトイン + ヘッダ通知 | §4.3, §25.3 |
+| 0013 | 単一デーモン・マルチセッションを唯一のプロセスモデルとする | §7.3, §26 |
+| 0014 | KV を Expert Cache に優先させる | §12.7 |
+| 0015 | Embedding を ROW_LOOKUP としてストリーミングする | §9.5, §17.4 |
+| 0016 | UMA では Vulkan ヒープを消費せず host pointer import で確保する | App. E.5 |
+| 0017 | コンテナは対応するが前提としない。`.msp` はイメージに含めない | App. F |
+
+---
+
+---
+
+## Appendix E: UMA / iGPU 実機プロファイルと固有設計
+
+> **本付録は実測に基づく。** 2026-08-02 に以下の実機で採取した値であり、
+> 本書の他章の理論値とは性質が異なる。
+
+### E.1 検証機のプロファイル
+
+| 項目 | 実測値 |
+|---|---|
+| CPU | AMD Ryzen 7 8745HS (8C/16T, Zen4) |
+| GPU | **AMD Radeon 780M (RADV PHOENIX)** — UMA / iGPU |
+| Mesa | 25.2.8 |
+| Vulkan | Instance 1.3.275 |
+| Kernel | **7.0.0-28-generic** |
+| `MemTotal` | 24,368,868 kB = **23.24 GiB** |
+| **iGPU VRAM carve-out** | **8.00 GiB** (`mem_info_vram_total`) |
+| **iGPU GTT (動的)** | **16.00 GiB** (`mem_info_gtt_total`) |
+| THP | `always [madvise] never` → **madvise 可** ✅ |
+| Explicit HugePages | `HugePages_Total: 0` → **不可** (§17.3 の想定通り) |
+| Storage 0 | Crucial **P3 Plus** 1 TB (PCIe 4.0, DRAM-less/HMB, QLC) |
+| Storage 1 | Crucial **P310** 1 TB (PCIe 4.0, DRAM-less/HMB, TLC) ← root |
+| Root FS | **ext4 直接マウント** (`/dev/nvme1n1p2`) — overlayfs ではない ✅ |
+
+### E.2 ゼロコピー経路の実機検証結果 ★
+
+§14.4 で設計した UMA ゼロコピー経路の前提条件を実機で確認した。
+これにより **§32.3 の未検証リスクのうち Vulkan 側が解消**された。
+
+| 必要な機能 | 実機 | 判定 |
+|---|---|---|
+| `VK_EXT_external_memory_host` | **対応** | ✅ **arena の host pointer import が可能** |
+| `VK_EXT_external_memory_dma_buf` | 対応 | ✅ 代替経路も利用可能 |
+| `VK_KHR_external_memory_fd` | 対応 | ✅ |
+| `VK_KHR_map_memory2` | 対応 | ✅ |
+| io_uring (kernel 7.0) | 利用可 | ✅ `DEFER_TASKRUN` / `SINGLE_ISSUER` 含む全機能 |
+| O_DIRECT (ext4 直接) | 利用可 | ✅ |
+| THP (madvise) | 利用可 | ✅ |
+
+**結論: 検証機において §14.4 の完全ゼロコピー経路
+(NVMe ──DMA──► Host Arena ◄──直接 read── iGPU) が成立する見込みが高い。**
+残る未検証項目は「同一領域を io_uring registered buffer と
+Vulkan imported memory の両方に同時登録できるか」の 1 点のみであり、
+これが M0 スパイクの最優先課題である。
+
+### E.3 【重要な設計上の見落とし】BIOS UMA Carve-out
+
+**§17 の予算設計は、BIOS が iGPU 用に固定確保するメモリを考慮していなかった。**
+これは UMA 環境固有の問題であり、本設計の主要ターゲットに直撃する。
+
+```
+  物理 RAM (推定 32 GiB)
+  ┌────────────────────────────────────────────────────────────┐
+  │ BIOS UMA Frame Buffer  8.00 GiB  │  OS から見える 23.24 GiB │
+  │  ← OS からは存在しない            │                          │
+  │  ← amdgpu が「VRAM」として報告     │  ← MoEStream が使える範囲 │
+  └────────────────────────────────────────────────────────────┘
+                                        ↑ GTT 16 GiB はここから動的に借りる
+```
+
+**MoEStream にとって、この 8 GiB の専用 VRAM carve-out はほぼ無価値である。**
+
+理由:
+1. §14.4 の設計では **arena を host pointer として import** するため、
+   専用 VRAM ヒープからの `vkAllocateMemory` を必要としない。
+2. APU では GTT (動的確保) も `MEMORY_HEAP_DEVICE_LOCAL_BIT` を持ち、
+   物理的には同一の DRAM である。専用ヒープに性能上の優位はない。
+3. Expert Cache は「OS から見える RAM」からしか確保できない。
+   carve-out された 8 GiB は **1 バイトも使えない**。
+
+**したがって、UMA 環境における最大の性能改善レバーは BIOS 設定である。**
+
+| BIOS の UMA Frame Buffer 設定 | OS 可視 RAM | Expert Cache に回せる量 | キャッシュ率 |
+|---|---:|---:|---:|
+| 8 GiB (現状) | 23.24 GiB | 7.6 GiB | 38% |
+| 2 GiB | ≈29.2 GiB | ≈13.6 GiB | **68%** |
+| 512 MiB (最小) | ≈30.7 GiB | ≈15.1 GiB | **75%** |
+
+キャッシュ率 38% → 68% は、§21.5 の見積りでヒット率が
+**約 62% → 約 80%** に相当する。§2.3 の必要ヒット率 55.9% に対して
+大きな余裕が生まれ、PR-2 (速度低下 20% 以内) の達成確度が劇的に上がる。
+
+**推奨設定と注意点**:
+
+```
+推奨: UMA Frame Buffer = 512 MiB 〜 2 GiB
+
+根拠: MoEStream は host pointer import で arena を直接読むため
+      専用 VRAM を必要としない。GTT が動的に不足分を賄う。
+
+注意 (正直に書く):
+  ⚠ GGML の Vulkan バックエンドは、経路によっては
+    DEVICE_LOCAL ヒープから通常の vkAllocateMemory を行う。
+    carve-out を極端に減らすと、常駐重み (1.2 GiB) の
+    デバイス側確保が GTT にフォールバックする。
+    APU では性能差は小さいはずだが、実測が必要。
+  ⚠ 同一マシンでゲーム等の他 GPU ワークロードを動かす場合、
+    carve-out 削減が悪影響を与える可能性がある。
+  ⚠ 一部の BIOS は最小値が 512 MiB より大きい / 設定項目が無い。
+
+→ M0 で 8 GiB / 2 GiB / 512 MiB の 3 条件を実測し、
+   結果を docs/findings/uma-carveout.md に公開する。
+```
+
+**設計への反映**: `moestream doctor` に UMA carve-out の検出と推奨を追加する。
+
+```
+moestream doctor (UMA 検出時の出力例)
+──────────────────────────────────────────────────────────────
+GPU        : AMD Radeon 780M (RADV PHOENIX) — UNIFIED       ✅
+host ptr   : VK_EXT_external_memory_host                    ✅ zero-copy 可
+VRAM       : 8.00 GiB (BIOS carve-out) / GTT 16.00 GiB
+OS 可視 RAM : 23.24 GiB
+
+⚠ UMA carve-out が 8.00 GiB あります。
+  MoEStream は host pointer import を使うため専用 VRAM をほぼ必要としません。
+  BIOS の "UMA Frame Buffer Size" を 512MiB〜2GiB に下げると、
+  最大 7.5 GiB が Expert Cache に転用できます
+  (キャッシュ率 38% → 75%、推定ヒット率 62% → 80%)。
+──────────────────────────────────────────────────────────────
+```
+
+### E.4 UMA 環境向け予算表 (§17.1 の UMA 版)
+
+§17.1 は dGPU も含む一般形だった。UMA 専用の予算表を示す。
+
+**ケース A: carve-out 8 GiB のまま (OS 可視 23.24 GiB、予算 10 GiB)**
+
+| 区分 | サイズ | UMA での差分 |
+|---|---:|---|
+| RESIDENT 重み | 1,224 MiB | GPU からも同じ実体を参照 (複製なし) |
+| **Expert Cache** | **7,600 MiB** | 同上。**VRAM 側の複製が存在しない** |
+| KV / State (4 sess) | 568 MiB | |
+| 実行時 | 447 MiB | staging バッファ 0 (dGPU なら +256 MiB) |
+| **合計** | **9.61 GiB** | dGPU 構成より **VRAM 分だけ丸ごと節約** |
+
+**ケース B: carve-out 512 MiB へ削減 (OS 可視 ≈30.7 GiB、予算 17 GiB)**
+
+| 区分 | サイズ |
+|---:|---:|
+| RESIDENT 重み | 1,224 MiB |
+| **Expert Cache** | **15,100 MiB (7,758 slots / 75.8%)** |
+| KV / State (8 sess) | 1,136 MiB |
+| 実行時 | 447 MiB |
+| **合計** | **17.5 GiB** |
+
+ケース B でも **フル常駐 22.3 GiB より 21% 少ない**まま、
+ヒット率が大幅に上がるため速度低下がほぼ消える。
+**「省メモリ」と「速度」のトレードオフ曲線上の、
+UMA 機における最良点はここにある可能性が高い** (§33 の `low-ram` スイープで確認する)。
+
+### E.5 UMA におけるヒープ選択の設計
+
+実機の Vulkan メモリヒープ構成:
+
+```
+memoryHeaps[0]: 8.00 GiB   flags: なし            ← BIOS carve-out (可視 VRAM)
+memoryHeaps[1]: 16.00 GiB  flags: DEVICE_LOCAL    ← GTT (システム RAM からの動的確保)
+```
+
+**注意すべき挙動**: 採取時点の `budget` は heap[0] 1.93 GiB / heap[1] 3.86 GiB だった
+(システムが既に 15.79 GiB を使用中だったため)。
+`budget` は動的に変わるため、**起動時のヒープ空き容量を前提にした静的な設計をしてはならない**。
+
+MoEStream の方針:
+
+| 対象 | 確保方法 |
+|---|---|
+| Expert Cache (arena) | **host pointer import** — Vulkan ヒープを消費しない ★ |
+| RESIDENT 重み | 同じ arena 内。同様に import |
+| 活性化 / scratch | 通常の `vkAllocateMemory` (DEVICE_LOCAL 優先、GTT フォールバック) |
+| KV Cache | 同上 |
+
+**Vulkan のヒープ予算に依存するのは scratch と KV だけ**にする。
+これにより「VRAM が足りない」という UMA 環境で頻出する失敗モードを構造的に回避する。
+これは通常の llama.cpp Vulkan 実行 (全重みを `vkAllocateMemory` する) に対する
+MoEStream の明確な優位点である。
+
+### E.6 検証機のストレージ特性と目標値
+
+両ドライブとも PCIe 4.0 / **DRAM-less (HMB)**。
+
+| ドライブ | 型番 | 想定逐次読出 | 備考 |
+|---|---|---:|---|
+| nvme1n1 (root) | Crucial P310 | ≈7.1 GB/s | TLC。`.msp` 配置先として推奨 |
+| nvme0n1 | Crucial P3 Plus | ≈5.0 GB/s | QLC |
+| 2 枚 RAID0 (md/LVM) | — | ≈11〜12 GB/s | §31.6 Ultra-Low-RAM モードが射程に入る |
+
+**§2.3 の表における位置**:
+
+| 構成 | 実効 BW | 必要ヒット率 (20% 低下) | 判定 |
+|---|---:|---:|---|
+| P310 単体 | 6.0 GB/s | **55.9%** | キャッシュ率 38% でも射程 |
+| RAID0 (2 枚) | 12.0 GB/s | **11.7%** | **キャッシュがほぼ不要になる** |
+
+**DRAM-less ドライブ固有の注意** (正直に記載):
+- HMB (Host Memory Buffer) はホスト RAM を数十 MiB 借りる。
+  §17 の予算に含まれない外部消費であり、`--mem-budget` の外側で発生する。
+- DRAM 搭載機に比べ **ランダム読出の p99 が悪化しやすい**。
+  §13.5 の適応 QD 制御 (`IoGovernor`) と §11.5 の到着順実行が、
+  まさにこの特性を吸収するための機構である。
+- QLC (P3 Plus) は SLC キャッシュ外での読出も安定するが、
+  §32.6 のサーマルスロットリングは 2230/2280 の DRAM-less 機で起きやすい。
+
+### E.7 検証機で現実的に期待される値 (改訂予測)
+
+```
+前提: carve-out 8 GiB のまま、--mem-budget 10 GiB、P310 単体、ctx 8K
+
+baseline (llama.cpp Vulkan フル常駐)  : 22.3 GiB / 推定 22〜28 tok/s
+                                         ※ ただし OS 可視 23.24 GiB では
+                                            実際にはほぼ限界。他アプリと共存不可
+
+MoEStream                              : 9.6 GiB / baseline の 80〜87%
+
+carve-out を 512 MiB へ削減した場合:
+MoEStream (予算 17 GiB)                : 17.5 GiB / baseline の 92〜97%
+MoEStream (予算 10 GiB のまま)          : 9.6 GiB / 変わらず (余った RAM は他用途へ)
+```
+
+> **注目すべき点**: 検証機は OS 可視 23.24 GiB しかないため、
+> **フル常駐 22.3 GiB は「動くが何も共存できない」状態**である。
+> 実際、採取時点で既に 15.79 GiB が使用中で `available` は 7.5 GiB しかなかった。
+> **この機体はまさに MoEStream が想定した「動くが占有しすぎる」の典型例**であり、
+> §1.3 の U1/U3 ユースケースに完全に該当する。
+
+---
+
+## Appendix F: コンテナ / Docker 運用要件
+
+### F.1 前提の明確化
+
+**本設計は Docker を前提としていない。**
+第一級の配布形態は §4.4 OR-3 の通り **単一静的バイナリ + systemd デーモン**である。
+コンテナは「動く環境の 1 つ」であり、必須でも推奨でもない。
+
+理由:
+- SSD ストリーミングは **ストレージとカーネル機能への直接アクセス**に依存する。
+  コンテナ化は原理的にこれらを妨げる方向に働く。
+- 主要ターゲット (個人の小型 PC / ノート) では systemd ユーザサービスが最も自然。
+
+ただし **コンテナで動かす需要は現実に存在する** (開発環境、複数バージョン共存、
+Agent 基盤への組込み) ため、要件を明文化する。
+
+### F.2 コンテナ実行の必須要件
+
+MoEStream は**通常のコンテナで壊れやすい 4 つの機能**に依存している。
+
+| # | 依存機能 | 既定コンテナでの問題 | 対処 |
+|---|---|---|---|
+| 1 | **io_uring** | Docker の既定 seccomp プロファイルは `io_uring_setup` / `io_uring_enter` / `io_uring_register` を**ブロックする構成があり得る**。gVisor 等では確実にブロック | `--security-opt seccomp=<プロファイル>` で許可、または `pread_pool` バックエンドへ自動フォールバック (§23.6) |
+| 2 | **O_DIRECT** | **overlayfs は O_DIRECT を正しく扱えない**。イメージ層に `.msp` を置くと致命的 | `.msp` は必ず**ボリュームまたは bind mount** に置く (ext4/xfs 直接) |
+| 3 | **GPU (Vulkan)** | `/dev/dri` が無いと iGPU が見えず CPU バックエンドに落ちる | `--device /dev/dri:/dev/dri` (+ `render` グループの GID 合わせ) |
+| 4 | **メモリ予算** | cgroup `memory.max` と `--mem-budget` の不整合で OOM Kill (§32.8) | `--mem-budget` ≤ `memory.max × 0.85`。未指定時は cgroup から自動導出 |
+
+### F.3 推奨実行例
+
+```bash
+docker run --rm \
+  --device /dev/dri:/dev/dri \
+  --group-add "$(getent group render | cut -d: -f3)" \
+  --security-opt seccomp=./docker/seccomp-iouring.json \
+  --memory 12g \
+  --mount type=bind,src=/srv/models,dst=/models,readonly \
+  --mount type=bind,src=/var/lib/moestream,dst=/var/lib/moestream \
+  -p 8080:8080 \
+  moestream/moestream:latest \
+    serve --model /models/qwen3.6-35b-a3b.msp \
+          --mem-budget 10GiB
+```
+
+**チェックリスト**:
+- [ ] `.msp` は bind mount 上 (overlayfs 上ではない)
+- [ ] `--memory` と `--mem-budget` に 15% 以上の差がある
+- [ ] `/dev/dri/renderD128` がコンテナ内から読めて、GID が合っている
+- [ ] `moestream doctor` を最初に実行して全項目を確認する
+
+### F.4 `moestream doctor` のコンテナ検査項目
+
+コンテナ内で実行された場合、以下を自動検査して警告する。
+
+```
+moestream doctor (コンテナ内での出力例)
+──────────────────────────────────────────────────────────────
+実行環境    : コンテナ (cgroup v2)
+seccomp     : filters=0                              ✅ io_uring 利用可
+io_uring    : kernel 7.0 / DEFER_TASKRUN 可           ✅
+モデル配置   : /models/x.msp → ext4 (bind mount)      ✅ O_DIRECT 可
+GPU         : /dev/dri/renderD128 アクセス可          ✅ RADV PHOENIX
+cgroup 制限  : memory.max = 12 GiB
+予算         : --mem-budget 10 GiB (制限の 83%)        ✅
+THP         : madvise                                ✅
+──────────────────────────────────────────────────────────────
+```
+
+**失敗例と自動対処**:
+
+| 検出 | 自動対処 | 警告 |
+|---|---|---|
+| seccomp が io_uring をブロック | `pread_pool` へフォールバック | 「性能が 10〜20% 低下します」 |
+| `.msp` が overlayfs 上 | O_DIRECT を無効化しバッファード I/O へ | 「RAM 上限保証が緩みます。bind mount を推奨」 |
+| `/dev/dri` 無し | CPU バックエンドへ | 「`--device /dev/dri` を追加してください」 |
+| `memory.max` < `--mem-budget × 1.15` | 起動拒否 | 「OOM Kill の危険。予算を下げてください」 |
+
+### F.5 提供するイメージ
+
+| タグ | 内容 | サイズ目標 |
+|---|---|---|
+| `moestream:latest` | Vulkan (RADV/ANV/NVIDIA) 対応、Ubuntu 24.04 ベース | < 400 MiB |
+| `moestream:cpu` | CPU バックエンドのみ、distroless | < 80 MiB |
+| `moestream:cuda` | CUDA 対応 | < 2 GiB |
+| `moestream:dev` | ビルド環境・ベンチ一式 | — |
+
+**イメージに `.msp` を含めない。** 20 GiB のモデルをイメージ層に入れることは
+overlayfs 上に置くことを意味し、F.2 の #2 に真っ向から反する。
+モデルは必ず外部ボリュームから供給する設計とし、
+Dockerfile と README でこれを明示する。
+
+### F.6 Kubernetes での利用 (v1.1 以降)
+
+```yaml
+# 要点のみ
+resources:
+  limits:   { memory: 12Gi }
+  requests: { memory: 12Gi }        # burstable にしない (予算保証のため)
+volumeMounts:
+  - { name: models, mountPath: /models, readOnly: true }   # PV (local または CSI)
+  - { name: cache,  mountPath: /var/lib/moestream }
+securityContext:
+  seccompProfile: { type: Localhost, localhostProfile: moestream-iouring.json }
+```
+
+**注意**: `emptyDir` や NFS 上に `.msp` を置くと帯域が出ない。
+**local PV (ノードの NVMe に直結) が事実上の必須要件**である。
+これは MoEStream が本質的にノードローカルなストレージ帯域に依存するためであり、
+Kubernetes での運用は「ノードに固定するワークロード」として設計すべきである。
+
+## 変更履歴
+
+| 版 | 日付 | 変更 |
+|---|---|---|
+| 0.1 | 2026-08-02 | 初版 (RFC)。実装前の設計 |
+| 0.2 | 2026-08-02 | Appendix E (UMA/iGPU 実機プロファイル) / F (コンテナ運用要件) を追加。<br/>Radeon 780M での `VK_EXT_external_memory_host` 対応を実機確認し §32.3 のリスクを一部解消。<br/>**BIOS UMA carve-out の見落としを §17 / §14.4 に反映** (ADR-0016/0017 を追加) |
+
+---
+
+## 本書の性質についての注記
+
+**本書に記載された性能数値は、公開されているモデル構成 (`config.json`) と
+量子化形式の仕様から算出した理論値であり、実測値ではない。**
+
+実測により覆される可能性のある主要な前提:
+
+1. Expert 活性化分布の歪み (§21.5, §32.1) — **最大の不確実性**
+2. iGPU + Vulkan における `t_c` の実測値 (§32.9)
+3. io_uring + O_DIRECT + Vulkan host ptr import の結合可能性 (§32.3)
+   — うち **Vulkan 拡張の存在は Appendix E.2 で実機確認済み**。
+   残るは「同一領域の二重登録」の 1 点
+4. 層先読み予測器の精度 (§22.6)
+
+**Appendix E のみ実測値である。** 他の全数値は計算値である。
+
+これらは §33 のベンチマークと §34 の M0 で検証され、
+結果に応じて本書は改訂される。
+
+**設計文書が実測より先行することは正しいが、
+実測が出た後も改訂されない設計文書は有害である。**

@@ -1,0 +1,32 @@
+# MoEStream — image for capturing expert-activation traces
+#
+# Uses llama.cpp unpatched. The router's selections can be captured through
+# llama_context_params.cb_eval, so there is no cost to tracking upstream.
+ARG BASE=moestream-dev-vk:local
+FROM ${BASE}
+
+ARG LLAMA_COMMIT=3581ba0cf591b3f772fbb002de0f70e294bc0396
+ARG WITH_VULKAN=ON
+
+WORKDIR /opt
+RUN git clone https://github.com/ggml-org/llama.cpp.git llama.cpp \
+    && cd llama.cpp && git checkout ${LLAMA_COMMIT}
+
+# Library only; server, examples and tests are unnecessary and slow the build
+RUN cmake -S /opt/llama.cpp -B /opt/llama.cpp/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_VULKAN=${WITH_VULKAN} \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_TOOLS=OFF \
+        -DLLAMA_BUILD_SERVER=OFF \
+        -DLLAMA_BUILD_APP=OFF \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_BUILD_HTML=OFF \
+        -DLLAMA_BUILD_COMMON=ON \
+    && cmake --build /opt/llama.cpp/build -j"$(nproc)" \
+    && echo "llama.cpp build done" \
+    && find /opt/llama.cpp/build -name 'lib*.so*' -printf '%f\n' | sort -u
+
+ENV LLAMA_ROOT=/opt/llama.cpp
+WORKDIR /work
