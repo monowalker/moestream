@@ -1045,10 +1045,10 @@ Checked and found sound:
 |---|---:|
 | `src/llama-moestream.{h,cpp}` | 2498 |
 | `src/expert_cache.{hpp,cpp}` | 425 |
-| `src/apply.py` (the llama.cpp patch) | 233 |
+| `src/apply.py` (the llama.cpp patch) | 255 |
 | `src/entrypoint.sh` | ~175 |
 | `research/tools/*.sh` | ~325 |
-| **product total** | **3156** |
+| **product total** | **3178** |
 | spikes (verification, not shipped) | 3883 |
 | documentation | 11610 |
 

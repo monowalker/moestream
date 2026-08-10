@@ -24,33 +24,55 @@ s = p.read_text()
 if 'moestream' not in s:
     s = s.replace('#include "llama-model-loader.h"',
                   '#include "llama-model-loader.h"\n#include "llama-moestream.h"', 1)
+    # create_tensor has two upstream spellings, and both are supported.
+    #
+    #   Until llama.cpp 1269cb1f ("model : allow reshape of tensors during load",
+    #   #26531) the tensor was duplicated straight from the file metadata `cur`.
+    #   That commit introduced a local `ggml_tensor t_meta = *cur;` whose ne/nb
+    #   are rewritten when TENSOR_ALLOW_RESHAPE is set, and duplicates from that
+    #   instead. `cur` still exists, but it is no longer the shape the tensor is
+    #   created with, so the slab has to be sized from whichever one upstream
+    #   itself uses -- otherwise a reshaped expert tensor would get a slab built
+    #   from the pre-reshape dimensions.
+    #
+    #   MS_META below is that expression; the body is otherwise identical.
     old = """    const bool duplicated = flags & TENSOR_DUPLICATED;
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));"""
+    old_reshape = """    const bool duplicated = flags & TENSOR_DUPLICATED;
+
+    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+    ggml_set_name(tensor, ggml_get_name(&t_meta));"""
     new = """    const bool duplicated = flags & TENSOR_DUPLICATED;
 
     struct ggml_tensor * tensor = nullptr;
     {
         // ---- MoEStream: allocate expert tensors as a reduced slot slab ----
-        const uint32_t n_slot = moestream::slab_slots(ggml_get_name(cur), cur->ne[2]);
-        if (n_slot > 0 && ggml_n_dims(cur) == 3) {
-            tensor = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], (int64_t) n_slot);
-            ggml_set_name(tensor, ggml_get_name(cur));
-            const auto * w = get_weight(ggml_get_name(cur));
+        const struct ggml_tensor * ms_meta = MS_META;
+        const uint32_t n_slot = moestream::slab_slots(ggml_get_name(ms_meta), ms_meta->ne[2]);
+        if (n_slot > 0 && ggml_n_dims(ms_meta) == 3) {
+            tensor = ggml_new_tensor_3d(ctx, ms_meta->type, ms_meta->ne[0], ms_meta->ne[1], (int64_t) n_slot);
+            ggml_set_name(tensor, ggml_get_name(ms_meta));
+            const auto * w = get_weight(ggml_get_name(ms_meta));
             if (w) {
-                const uint64_t ebytes = ggml_nbytes(cur) / (uint64_t) cur->ne[2];
-                moestream::register_slab(ggml_get_name(cur), tensor,
-                                         w->offs, ebytes, cur->ne[2], (int) w->idx);
+                const uint64_t ebytes = ggml_nbytes(ms_meta) / (uint64_t) ms_meta->ne[2];
+                moestream::register_slab(ggml_get_name(ms_meta), tensor,
+                                         w->offs, ebytes, ms_meta->ne[2], (int) w->idx);
             }
         }
     }
     if (!tensor) {
-        tensor = ggml_dup_tensor(ctx, cur);
-        ggml_set_name(tensor, ggml_get_name(cur));
+        tensor = ggml_dup_tensor(ctx, MS_META);
+        ggml_set_name(tensor, ggml_get_name(MS_META));
     }"""
-    assert old in s, "create_tensor anchor not found"
-    s = s.replace(old, new, 1)
+    # (anchor, the expression upstream duplicates from)
+    variants = [(old, 'cur'), (old_reshape, '&t_meta')]
+    hit = next((v for v in variants if v[0] in s), None)
+    assert hit is not None, ("create_tensor anchor not found "
+                             "(neither the pre-#26531 `cur` nor the post-#26531 `&t_meta` spelling)")
+    anchor, ms_meta = hit
+    s = s.replace(anchor, new.replace('MS_META', ms_meta), 1)
 
     # --- load_all_data: never read the slab from the file ---
     old2 = """        const auto * weight = get_weight(ggml_get_name(cur));"""

@@ -352,10 +352,10 @@ compose.yaml      how it runs
 .env.example      the settings a human chooses
 Makefile          up / down / logs / test / bench
 
-src/              the product. 3156 lines, and that is all of it.
+src/              the product. 3178 lines, and that is all of it.
   llama-moestream.{h,cpp}   the runtime: slots, cache, reads, remap   2498
   expert_cache.{hpp,cpp}    S3-FIFO cache, one per layer                425
-  apply.py                  where it attaches to llama.cpp              231
+  apply.py                  where it attaches to llama.cpp              255
   entrypoint.sh             derives threads, batch size, GPU checks
 
 docs/             design, measurements, and the reasoning
@@ -412,7 +412,7 @@ There is no llama.cpp clone in this repository. The build fetches it.
 At run time it also depends on GGUF tensor naming and a few internal members of
 ggml-vulkan.
 
-Every edit is guarded by `assert old in s, "..."`. If upstream moves the code an
+Every edit is guarded by a named `assert` on its anchor text. If upstream moves the code an
 edit attaches to, **the build stops and names it** — it cannot produce a
 half-patched binary. `research/tests/test_apply_patch.py` verifies that guard by
 deleting each anchor in turn and checking the build refuses.
