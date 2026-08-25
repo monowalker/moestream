@@ -24,11 +24,18 @@ services:
       - "${RENDER_GID:-992}"
       - "${VIDEO_GID:-44}"
 
-    # Pass .env through verbatim; src/entrypoint.sh expands the values.
+    # Pass the environment through verbatim; src/entrypoint.sh expands the
+    # values. .env.launcher is what launcher.sh writes, and it is read second so
+    # its answers win over .env. Neither file has to exist.
     env_file:
-      - .env
+      - path: .env
+        required: false
+      - path: .env.launcher
+        required: false
     environment:
-      MOESTREAM_GGUF: "/models/${MODEL_FILE}"
+      # MOESTREAM_GGUF is deliberately not set here. entrypoint.sh derives it
+      # from MODEL_FILE, so the file the server loads and the name the learn
+      # table is keyed on can never disagree.
       XDG_RUNTIME_DIR: /tmp
 
     volumes:

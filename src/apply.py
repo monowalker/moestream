@@ -61,6 +61,21 @@ if 'moestream' not in s:
                                          w->offs, ebytes, ms_meta->ne[2], (int) w->idx);
             }
         }
+        // ---- MoEStream: dense FFN weights on a streamed layer ----
+        //   Allocated as a one-row stub. The real bytes are read into the arena
+        //   at graph time; allocating the full tensor here would leave the whole
+        //   model resident and save nothing. Nothing reads the stub, because
+        //   build_ffn substitutes the arena tensor for it.
+        if (!tensor && moestream::dense_claim(ggml_get_name(ms_meta), ggml_n_dims(ms_meta), ggml_nbytes(ms_meta))) {
+            tensor = ggml_new_tensor_2d(ctx, ms_meta->type, ms_meta->ne[0], 1);
+            ggml_set_name(tensor, ggml_get_name(ms_meta));
+            const auto * w = get_weight(ggml_get_name(ms_meta));
+            if (w) {
+                moestream::register_dense(ggml_get_name(ms_meta), tensor, w->offs,
+                                          ggml_nbytes(ms_meta), (int) w->idx,
+                                          (int) ms_meta->type, ms_meta->ne[0], ms_meta->ne[1]);
+            }
+        }
     }
     if (!tensor) {
         tensor = ggml_dup_tensor(ctx, MS_META);
@@ -116,6 +131,34 @@ if 'moestream' not in s:
     s = _re.sub(r'build_lora_mm_id\((?:gate_up_exps|up_exps|gate_exps|down_exps), cur, selected_experts',
                 repl, s)
     assert n_mm >= 3, f"expected at least 3 mul_mat_id replacements, got {n_mm}"
+
+    # ---- dense FFN streaming: substitute the arena tensors in build_ffn ----
+    #   This hook was briefly moved to build_lora_mm, which every per-layer
+    #   weight passes through, in order to reach attention and SSM as well.
+    #   That failed twice over: stubbing cannot survive code that reads a
+    #   weight's SHAPE (Qwen3.5's SSM path does), and the wider hook then broke
+    #   the FFN case that had been working. Reverted to the anchor that S27
+    #   measured. See docs/findings for why the generalisation needs a
+    #   different design, not a wider filter.
+    old_ffn = "    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;"
+    new_ffn = """    // MoEStream: on a streamed dense layer the FFN weights live in the arena.
+    //   build_dense_load fills it and returns `cur` unchanged, so consuming its
+    //   output below is what orders "arena filled -> mul_mat runs".
+    if (moestream::dense_active()) {
+        ggml_tensor * ms_du = moestream::dense_ffn(il, 1);
+        ggml_tensor * ms_dd = moestream::dense_ffn(il, 2);
+        if (ms_du && ms_dd) {
+            ggml_tensor * ms_dg = moestream::dense_ffn(il, 0);
+            cur  = moestream::build_dense_load(ctx0, cur, il);
+            up   = ms_du;
+            down = ms_dd;
+            if (gate && ms_dg) gate = ms_dg;
+        }
+    }
+
+    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;"""
+    assert old_ffn in s, "build_ffn anchor not found"
+    s = s.replace(old_ffn, new_ffn, 1)
 
     # ---- Expert Sweep: wrap the FFN body in a loop of P passes ----
     #   Splits when the union exceeds the slab capacity (prefill).

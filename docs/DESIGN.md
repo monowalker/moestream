@@ -2,12 +2,18 @@
 
 > **A low-memory SSD-streaming inference runtime, specifically for MoE models**
 > Design Document v0.1 (Draft for RFC) — 2026-08
+>
+> *"specifically for MoE" is one of the decisions this document got wrong. Dense
+> models are supported as of 2026-08-23 — see NG-4 below and
+> [`findings/S27-dense-streaming-impl.md`](findings/S27-dense-streaming-impl.md).*
 
 > ## ⚠ What this document is (as of 2026-08-06)
 >
 > **This was written before implementation and does not describe the current
-> implementation.** After building and measuring it, **14 of the design
-> decisions here have been overturned.**
+> implementation.** After building and measuring it, **15 of the design
+> decisions here have been overturned** — including the scope itself: NG-4 ruled
+> dense models out on the grounds that streaming "cannot work in principle" for
+> them, and dense FFN streaming now ships.
 >
 > | What you want | Where to look |
 > |---|---|
@@ -75,7 +81,7 @@
 34. [Development roadmap](#34-development-roadmap)
 35. [Designing for open-source release](#35-designing-for-open-source-release)
 - [Appendix A: symbols and the analytical model](#appendix-a-symbols-and-the-analytical-model)
-- [Appendix B: Qwen3.6-35B-A3B measured figures](#appendix-b-qwen3635b-a3b-measured-figures)
+- [Appendix B: Qwen3.6-35B-A3B measured figures](#appendix-b-measured-figures-for-qwen36-35b-a3b)
 - [Appendix C: glossary](#appendix-c-glossary)
 - [Appendix D: ADR index](#appendix-d-adr-index)
 - [Appendix E: UMA / integrated GPU profile and specific design](#appendix-e-uma--integrated-gpu-profile-and-specific-design) ★measured
@@ -452,7 +458,7 @@ an ADR.
 | NG-1 | **training and fine-tuning** | stay strictly an inference runtime. Being read-only simplifies the I/O design |
 | NG-2 | **multi-node distribution** | the goal is reducing RAM on one node. Distribution does not solve it and only adds complexity |
 | NG-3 | **optimizing models above 100B** | they run, but land in regime A where this design's premise breaks. Send users to Colibri |
-| NG-4 | **optimizing dense models** | for dense, `B_act = total size` and streaming cannot work in principle. Compatibility only |
+| NG-4 | ~~**optimizing dense models**~~ → **overturned 2026-08-23** | The reason given — `B_act = total size` — is true per *pass*, not per *token*, and a prefill pass carries a thousand tokens. Dense FFN streaming is implemented and measured at **−56% memory with byte-identical output and free prompt processing** (findings S18/S21/S27/S29/S30). What does hold is that single-token generation costs 3.2x |
 | NG-5 | **writing our own GEMM kernels** | we would lose to GGML/BLAS. Not a differentiator |
 | NG-6 | **inventing a quantization format** | use GGUF's Q4_K/Q6_K/IQ families as they are. No requantization |
 | NG-7 | **PyTorch → GGUF conversion** | use llama.cpp's `convert_hf_to_gguf.py` |

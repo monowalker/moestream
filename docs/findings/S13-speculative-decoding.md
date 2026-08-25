@@ -64,6 +64,13 @@ Loading Qwen3.5-4B (2.71 GiB) takes memory from 6.59 to 9.80 GiB, squeezing the
 slab and lowering the hit rate. **Any technique that needs extra memory is
 doubly disadvantaged in a system where memory is the constraint.**
 
+
+> **[2026-08-23]** MTP could not be tested here — Ornith-1.0 has no
+> `nextn_predict_layers`. Finding S31 tests it on Ornith-1.5 and confirms this
+> section's mechanism at **88.7% acceptance**, which removes the objection that
+> the 0.346 draft acceptance above was the real cause. It also shows the sign
+> flips for dense models, where a pass has no union to widen.
+
 ## Generalisation
 
 > **In an I/O-bound system, every technique of the form "do more computation to

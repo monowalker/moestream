@@ -44,6 +44,7 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <set>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <csignal>
@@ -123,6 +124,16 @@ static uint64_t                  g_maxb     = 0;   // largest single-member size
 //   so an all-zero block decodes to zero and the expert's contribution simply
 //   vanishes rather than producing garbage.
 static int      g_drop_from = 1 << 30;
+// ---- dense FFN streaming knobs (findings S18/S21/S26); see the block below ----
+static double   g_dn_frac    = -1.0;  // fraction of layers kept RESIDENT; 1.0 = off, <0 = auto
+static bool     g_dn_auto    = true;  // decide the split from the memory budget
+static bool     g_dn_learn   = false; // also record the measured cost curve
+static int      g_dn_nlayer  = 0;     // total layers, from GGUF metadata
+static int      g_dn_first   = -1;    // first streamed layer (-1 = none)
+static int      g_dn_nbuf    = 2;
+static bool     g_dn_ready   = false;
+static bool     g_dn_seen    = false; // a dense FFN tensor was claimed
+static int      g_dn_th      = 4;     // dense read threads (finding S29, end-to-end)
 static uint32_t g_zero_slot = 0;         // zero-filled slot reserved at the end of the slab
 static uint64_t g_dropped   = 0, g_demand = 0;
 static bool     g_zero_filled = false;
@@ -388,8 +399,21 @@ bool enabled() {
         if (const char * f = getenv("MOESTREAM_PREFETCH")) g_prefetch = atoi(f) ? 1 : 0;
         if (const char * t = getenv("MOESTREAM_IO_THREADS")) {
             g_nthreads = std::max(1, atoi(t)); g_io_auto = false;   // explicit value pins it
+            g_dn_th = g_nthreads;
         }
         if (const char * d = getenv("MOESTREAM_DROP_FROM")) g_drop_from = atoi(d);
+        if (const char * d = getenv("MOESTREAM_DENSE_FRAC")) {
+            if      (strcmp(d, "auto")  == 0) { g_dn_auto = true;  g_dn_learn = false; }
+            else if (strcmp(d, "learn") == 0) { g_dn_auto = true;  g_dn_learn = true;  }
+            else if (strcmp(d, "off")   == 0) { g_dn_auto = false; g_dn_frac = 1.0;    }
+            else {
+                g_dn_auto = false;
+                g_dn_frac = atof(d);
+                if (g_dn_frac < 0.0) g_dn_frac = 0.0;
+                if (g_dn_frac > 1.0) g_dn_frac = 1.0;
+            }
+        }
+        if (const char * b = getenv("MOESTREAM_DENSE_BUFS")) g_dn_nbuf = std::max(1, atoi(b));
         if (const char * u = getenv("MOESTREAM_MAX_UBATCH")) g_max_ubatch = std::max(1, atoi(u));
         if (const char * t = getenv("MOESTREAM_PREFILL_THRESHOLD")) g_pf_threshold = atoi(t);
         if (g_enabled) {
@@ -418,6 +442,118 @@ static bool parse_name(const char * name, int & il, int & role) {
     else if (strstr(end, ".ffn_down_exps.weight")) role = 2;
     else return false;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Dense FFN streaming (findings S18 / S21 / S26)
+// ---------------------------------------------------------------------------
+//   The slab does not apply here. It works by shrinking ne[2], the expert
+//   dimension, so that mul_mat_id runs against a smaller array. A dense FFN
+//   weight is 2D and goes through plain mul_mat -- there is no expert
+//   dimension to shrink. Only the arena approach transfers.
+//
+//   So: keep the first K layers resident, and give the rest an arena holding
+//   one layer's FFN, filled by a CPU op immediately before that layer runs.
+//   The model's own tensors for streamed layers are allocated as stubs, since
+//   allocating them at full size would leave the whole model resident and save
+//   nothing.
+//
+//   Stream the TAIL, not the head. Which layers are streamed does not change
+//   bytes/token -- a dense model uses every layer exactly once -- but it
+//   changes how much can be hidden: with the tail streamed, the forward pass
+//   through the resident head is time the reads happen in.
+//
+//   And here dense beats MoE outright. Every predictive prefetch scheme in this
+//   project failed (N2 / S10 / S11 / §10.14) because layer L+1's experts cannot
+//   be known until layer L has run. A dense model has nothing to predict:
+//   layer 33 is always layer 33. Perfect prefetch at zero prediction cost.
+//
+//   v1 streams the FFN only (about 60% of a dense model). Attention would need
+//   a second graph anchor and is not attempted here.
+
+struct DenseInfo {
+    ggml_tensor * t    = nullptr;     // arena-backed tensor used by the graph
+    // Offset within the arena buffer. Reads must go through the HOST pointer
+    // (g_dn_host[bi] + arena_off); t->data is a device address on Vulkan and
+    // pread into it fails silently, leaving the arena full of garbage while
+    // everything still runs at full speed. That is exactly how this was first
+    // shipped, and RESULTS.md §10.8 is the standing warning about it.
+    uint64_t arena_off = 0;
+    uint64_t file_offset = 0;
+    uint64_t bytes     = 0;
+    uint16_t file_idx  = 0;
+    int      type      = 0;
+    int      role      = -1;
+    int64_t  ne0 = 0, ne1 = 0;
+    bool     valid     = false;
+};
+//   Not just the FFN. Every per-layer weight matrix in llama.cpp is consumed by
+//   build_lora_mm(), so claiming any large 2D blk.* weight and substituting at
+//   that one choke point covers FFN, attention and SSM alike -- without a single
+//   architecture-specific branch (ADR-0036). Which is why the hook moved there
+//   from build_ffn: the first version could only reach the FFN.
+struct DenseLayer { std::vector<DenseInfo> w; bool ready = false; };
+
+static std::map<int, DenseLayer> g_dn_meta;   // file locations, per streamed layer
+// original model tensor -> (layer, index within that layer)
+static std::map<const ggml_tensor *, std::pair<int,int>> g_dn_bypointer;
+static std::set<std::string> g_dn_claimed;    // names actually stubbed
+static uint64_t g_dn_min_bytes = 8u << 20;    // ignore anything smaller; norms and
+                                              // biases are not worth a graph node
+static std::map<int, DenseLayer> g_dn_view;   // arena-backed tensors, per streamed layer
+static std::vector<void *>       g_dn_host;
+static std::vector<ggml_backend_buffer_t> g_dn_buf;
+static std::vector<int>          g_dn_resident;   // which layer each arena holds
+static ggml_context *            g_dn_ctx   = nullptr;
+static size_t                    g_dn_bytes_per = 0;
+static uint64_t g_dn_loads = 0, g_dn_hits = 0, g_dn_read_bytes = 0;
+static double   g_dn_t_read = 0;
+// async prefetch of the next streamed layer
+static std::thread g_dn_thread;
+static int         g_dn_inflight = -1;
+static uint64_t    g_dn_pf_hit = 0, g_dn_pf_miss = 0;
+
+// Any per-layer weight matrix large enough to be worth streaming.
+//   role is just this weight's slot within the layer, assigned in load order --
+//   there is no need to know what the weight IS, only where its bytes live and
+//   which tensor to substitute. That is what keeps this architecture-agnostic.
+//   Expert tensors are excluded: the slab owns those.
+static bool parse_dense_any(const char * name, int & il, int & role, uint64_t nbytes) {
+    if (strncmp(name, "blk.", 4) != 0) return false;
+    char * end = nullptr;
+    long v = strtol(name + 4, &end, 10);
+    if (!end || *end != '.') return false;
+    if (nbytes < g_dn_min_bytes) return false;
+    // FFN only, and deliberately so.
+    //
+    //   The first attempt claimed every large 2D per-layer weight, on the
+    //   reasoning that they all reach ggml_mul_mat through build_lora_mm. They
+    //   do -- but that is not the only thing that touches them. A streamed
+    //   weight is allocated as a one-row stub, and any code that reads its
+    //   SHAPE rather than multiplying by it then sees the stub. Qwen3.5's SSM
+    //   path does exactly that:
+    //
+    //     ggml_concat <- build_conv_state <- build_layer_attn_linear
+    //     GGML_ASSERT(a->ne[d] == b->ne[d]) failed
+    //
+    //   So stubbing cannot generalise. Extending this to attention and SSM
+    //   needs the model tensors allocated at their REAL shape but bound to
+    //   arena memory, so the shape is always right and only the bytes are
+    //   shared. That is a different design, not a wider filter.
+    //
+    //   Matching on ffn_gate/up/down is not an architecture branch: it is the
+    //   same reliance on GGUF's naming convention that identifies experts by
+    //   ffn_*_exps.
+    if      (strcmp(end, ".ffn_gate.weight") == 0) role = 0;
+    else if (strcmp(end, ".ffn_up.weight")   == 0) role = 1;
+    else if (strcmp(end, ".ffn_down.weight") == 0) role = 2;
+    else return false;
+    il = (int) v;
+    return true;
+}
+
+static bool dense_streamed_layer(int il) {
+    return g_dn_first >= 0 && il >= g_dn_first;
 }
 
 // ---------------------------------------------------------------------------
@@ -469,10 +605,10 @@ static const std::vector<std::string> & shard_paths() {
 //   need term wins, the slab comes up short, and slot exhaustion corrupts the
 //   output. Scanning the GGUF keys directly keeps this architecture-agnostic.
 // ---------------------------------------------------------------------------
-static int gguf_topk() {
-    static int cached = -1;
-    if (cached >= 0) return cached;
-    cached = 0;
+// Read one integer KV from the GGUF header by key suffix. The key is prefixed
+// with the architecture name, so only the suffix is matched.
+static int gguf_kv_int(const char * suf_in) {
+    int cached = 0;
 
     const auto & sh = shard_paths();
     if (sh.empty()) return 0;
@@ -524,8 +660,8 @@ static int gguf_topk() {
         uint32_t vt; if (!rd(&vt, 4)) break;
         // The key is prefixed with the architecture name, so match the suffix
         //   e.g. qwen3next.expert_used_count / llama.expert_used_count
-        static const char suf[] = ".expert_used_count";
-        const size_t sl = sizeof(suf) - 1;
+        const char * suf = suf_in;
+        const size_t sl = strlen(suf);
         const bool want = key.size() >= sl &&
                           key.compare(key.size() - sl, sl, suf) == 0;
         int64_t v = 0;
@@ -534,6 +670,94 @@ static int gguf_topk() {
     }
     fclose(f);
     return cached;
+}
+
+static int gguf_topk() {
+    static int cached = -1;
+    if (cached < 0) cached = gguf_kv_int(".expert_used_count");
+    return cached;
+}
+
+static int gguf_nlayer() {
+    static int cached = -1;
+    if (cached < 0) cached = gguf_kv_int(".block_count");
+    return cached;
+}
+
+// 0 on a dense model: the key is absent. This is what lets the runtime pick the
+// expert path or the dense path on its own, without the operator being asked.
+static int gguf_nexpert() {
+    static int cached = -1;
+    if (cached < 0) cached = gguf_kv_int(".expert_count");
+    return cached;
+}
+
+// Sum the bytes of everything the dense path would claim, by walking the GGUF
+// tensor index. Needed before the first tensor is allocated, which is why it
+// cannot be accumulated as tensors arrive.
+static void gguf_scan_streamable(uint64_t * total, uint64_t * layer_max) {
+    *total = 0; *layer_max = 0;
+    const auto & sh = shard_paths();
+    std::map<int, uint64_t> per_layer;
+    for (const auto & path : sh) {
+        FILE * f = fopen(path.c_str(), "rb");
+        if (!f) continue;
+        auto rd = [&](void * p, size_t n) { return fread(p, 1, n, f) == n; };
+        char magic[4]; uint32_t ver = 0; uint64_t n_tensor = 0, n_kv = 0;
+        if (!rd(magic, 4) || memcmp(magic, "GGUF", 4) != 0 ||
+            !rd(&ver, 4) || !rd(&n_tensor, 8) || !rd(&n_kv, 8)) { fclose(f); continue; }
+        // skip the KV section
+        std::function<bool(uint32_t)> skip = [&](uint32_t t) -> bool {
+            static const size_t fixed[13] = {1,1,2,2,4,4,4,1,0,0,8,8,8};
+            if (t == 8) { uint64_t n; if (!rd(&n, 8)) return false;
+                          return fseek(f, (long) n, SEEK_CUR) == 0; }
+            if (t == 9) { uint32_t et; uint64_t n;
+                          if (!rd(&et, 4) || !rd(&n, 8)) return false;
+                          for (uint64_t i = 0; i < n; ++i) if (!skip(et)) return false;
+                          return true; }
+            if (t > 12) return false;
+            return fseek(f, (long) fixed[t], SEEK_CUR) == 0;
+        };
+        bool ok = true;
+        for (uint64_t i = 0; i < n_kv && ok; ++i) {
+            uint64_t kl; if (!rd(&kl, 8) || kl > (1u << 20)) { ok = false; break; }
+            if (fseek(f, (long) kl, SEEK_CUR) != 0) { ok = false; break; }
+            uint32_t vt; if (!rd(&vt, 4) || !skip(vt)) ok = false;
+        }
+        if (!ok) { fclose(f); continue; }
+        // tensor index: name, n_dims, dims[], type, offset
+        struct Ent { std::string name; uint32_t nd; uint64_t off; };
+        std::vector<Ent> ents; ents.reserve((size_t) n_tensor);
+        for (uint64_t i = 0; i < n_tensor && ok; ++i) {
+            uint64_t nl2; if (!rd(&nl2, 8) || nl2 > (1u << 16)) { ok = false; break; }
+            std::string nm(nl2, '\0'); if (!rd(&nm[0], nl2)) { ok = false; break; }
+            uint32_t nd; if (!rd(&nd, 4) || nd > 4) { ok = false; break; }
+            for (uint32_t d = 0; d < nd; ++d) { uint64_t x; if (!rd(&x, 8)) { ok = false; break; } }
+            uint32_t ty; uint64_t off;
+            if (!ok || !rd(&ty, 4) || !rd(&off, 8)) { ok = false; break; }
+            ents.push_back({ nm, nd, off });
+        }
+        fclose(f);
+        if (!ok || ents.empty()) continue;
+        struct stat st; uint64_t fsz = 0;
+        if (stat(path.c_str(), &st) == 0) fsz = (uint64_t) st.st_size;
+        std::vector<size_t> order(ents.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](size_t a, size_t b) { return ents[a].off < ents[b].off; });
+        for (size_t k = 0; k < order.size(); ++k) {
+            const Ent & e = ents[order[k]];
+            const uint64_t end = (k + 1 < order.size()) ? ents[order[k+1]].off : fsz;
+            if (end <= e.off) continue;
+            const uint64_t nb = end - e.off;
+            int il, role;
+            if (e.nd == 2 && parse_dense_any(e.name.c_str(), il, role, nb)) {
+                *total += nb;
+                per_layer[il] += nb;
+            }
+        }
+    }
+    for (const auto & kv : per_layer) *layer_max = std::max(*layer_max, kv.second);
 }
 
 // ---------------------------------------------------------------------------
@@ -864,7 +1088,124 @@ uint32_t slab_slots(const char * name, int64_t n_expert) {
 bool skip_load(const char * name) {
     if (!enabled()) return false;
     int il, role;
-    return parse_name(name, il, role);
+    if (parse_name(name, il, role)) return true;
+    // Streamed dense FFN weights are stubs; their contents come from the arena.
+    // Only what was actually claimed. Deciding again from the name would be a
+    // different test than the one that ran at allocation time, and the failure
+    // mode is a real weight left unread.
+    if (g_dn_claimed.count(name)) return true;
+    return false;
+}
+
+// Decide whether this tensor is a dense FFN weight on a streamed layer.
+//   Called from the loader before allocation. The layer split needs the layer
+//   count, which is not known from the tensor name, so it is read from the GGUF
+//   header the same way top_k is.
+bool dense_claim(const char * name, int64_t n_dims, uint64_t nbytes) {
+    if (!enabled()) return false;
+    if (n_dims != 2) return false;
+    int il = -1, role = -1;
+    if (!parse_dense_any(name, il, role, nbytes)) return false;
+
+    if (g_dn_nlayer == 0) {
+        g_dn_nlayer = -1;                                    // decided, possibly to "off"
+        // ---- is this a dense model at all? ----
+        //   A MoE model has expert tensors; its dense ffn_* weights (shared
+        //   experts, leading dense layers) belong to the expert path and must
+        //   not be stubbed. Decided from metadata, not from the operator.
+        if (gguf_nexpert() > 0) {
+            fprintf(stderr, "moestream: [dense] MoE model (%d experts); "
+                            "expert streaming handles this, dense path off\n", gguf_nexpert());
+            return false;
+        }
+        const int nl = gguf_nlayer();
+        if (nl <= 0) {
+            fprintf(stderr, "moestream: [dense] block_count unreadable; dense path off\n");
+            return false;
+        }
+        g_dn_nlayer = nl;
+
+        if (!g_dn_auto) {
+            if (g_dn_frac >= 1.0) { g_dn_nlayer = -1; return false; }   // explicitly off
+        } else {
+            // ---- decide the split from the memory budget ----
+            //   Stream the least that still fits. If the model already fits,
+            //   stream nothing and behave exactly like plain llama.cpp.
+            //   Unlike the expert cache there is no knee to find: finding S29
+            //   measured the cost as linear in bytes streamed, so "as little as
+            //   possible" is the whole policy.
+            uint64_t scan_total = 0, scan_layer_max = 0;
+            gguf_scan_streamable(&scan_total, &scan_layer_max);
+            // Extrapolating "three weights per layer x this one's size" was
+            // right only for the FFN-only version. Read the tensor index.
+            const double ffn_gib  = scan_total
+                ? (double) scan_total / 1073741824.0
+                : 3.0 * (double) nl * (double) nbytes / 1073741824.0;
+            double file_gib = 0;
+            for (const auto & sp : shard_paths()) {
+                struct stat st;
+                if (stat(sp.c_str(), &st) == 0) file_gib += (double) st.st_size / 1073741824.0;
+            }
+            const double nonffn_gib = std::max(0.0, file_gib - ffn_gib);
+            const double layer_gib  = ffn_gib / (double) nl;
+            double dev_t = 0, dev_u = 0;
+            const bool have_mem = device_mem_gib(&dev_t, &dev_u);
+            double reserve = 2.0;
+            if (const char * r = getenv("MOESTREAM_MEM_RESERVE_GIB")) reserve = atof(r);
+            // Everything but the streamed FFN has to be resident, plus the
+            // arena and whatever the KV cache will want.
+            const double budget = have_mem ? (dev_t - reserve - dev_u) : 0.0;
+            const double for_ffn = budget - nonffn_gib - g_dn_nbuf * layer_gib;
+            double frac = 1.0;
+            if (have_mem && ffn_gib > 0) {
+                frac = for_ffn / ffn_gib;
+                if (frac > 1.0) frac = 1.0;
+                if (frac < 0.0) frac = 0.0;
+            }
+            g_dn_frac = frac;
+            fprintf(stderr,
+                "moestream: [dense] auto: model %.2f GiB (FFN %.2f + other %.2f), "
+                "device %.1f GiB free of %.1f\n"
+                "moestream: [dense] auto: keeping %.0f%% of the FFN resident\n",
+                file_gib, ffn_gib, nonffn_gib, budget, dev_t, frac * 100.0);
+            if (frac >= 1.0) {
+                fprintf(stderr, "moestream: [dense] auto: the model fits; "
+                                "streaming nothing (identical to plain llama.cpp)\n");
+                g_dn_nlayer = -1;
+                return false;
+            }
+        }
+
+        int keep = (int) (g_dn_frac * (double) nl + 0.5);
+        if (keep < 0) keep = 0;
+        if (keep > nl) keep = nl;
+        g_dn_first = keep;
+        fprintf(stderr,
+            "moestream: [dense] %d layers, keeping %d resident, streaming %d..%d "
+            "(frac=%.2f%s)\n", nl, keep, keep, nl - 1, g_dn_frac,
+            g_dn_learn ? ", learn" : (g_dn_auto ? ", auto" : ""));
+    }
+    if (g_dn_nlayer < 0) return false;
+    if (!dense_streamed_layer(il)) return false;
+    g_dn_seen = true;
+    g_dn_claimed.insert(name);
+    return true;
+}
+
+void register_dense(const char * name, const ggml_tensor * stub, uint64_t file_offset,
+                    uint64_t bytes, int file_idx, int type, int64_t ne0, int64_t ne1) {
+    int il, role;
+    if (!parse_dense_any(name, il, role, bytes)) return;
+    DenseInfo di;
+    di.file_offset = file_offset; di.bytes = bytes;
+    di.file_idx = (uint16_t) (file_idx < 0 ? 0 : file_idx);
+    di.type = type; di.ne0 = ne0; di.ne1 = ne1; di.valid = true; di.role = role;
+    auto & L = g_dn_meta[il];
+    L.w.push_back(di);
+    L.ready = true;
+    // The graph never names these tensors; it hands build_lora_mm the pointer
+    // llama.cpp allocated. That pointer is the only usable key.
+    (void) stub;
 }
 
 void register_slab(const char * name, ggml_tensor * t,
@@ -963,9 +1304,123 @@ static uint8_t * slab_host_ptr(const SlabInfo & si, uint32_t slot) {
 }
 
 // ---------------------------------------------------------------------------
+// Dense FFN streaming setup. Runs before the expert path, because a dense
+// model has no expert tensors and finalize() would otherwise disable MoEStream
+// and return before reaching this.
+static bool g_dn_done = false;
+static void finalize_dense(const char * gguf_path) {
+    if (g_dn_done) return;
+    g_dn_done = true;
+    if (!g_dn_seen || g_dn_meta.empty()) return;
+
+    if (g_path.empty() && gguf_path && *gguf_path) g_path = gguf_path;
+    const auto & shards = shard_paths();
+    if (shards.empty()) {
+        fprintf(stderr, "moestream: [dense] GGUF path unknown; set MOESTREAM_GGUF\n");
+        return;
+    }
+    if (g_fds.empty()) {
+        g_fds.assign(shards.size(), -1);
+        for (size_t i = 0; i < shards.size(); ++i) {
+            g_fds[i] = open(shards[i].c_str(), O_RDONLY);
+            if (g_fds[i] < 0) {
+                fprintf(stderr, "moestream: [dense] cannot open %s\n", shards[i].c_str());
+                for (int fd : g_fds) if (fd >= 0) close(fd);
+                g_fds.clear();
+                return;
+            }
+        }
+    }
+    // ---- dense FFN arena ----
+    //   Only reached on a model with dense FFN weights and MOESTREAM_DENSE_FRAC
+    //   below 1. Sized to the largest single layer, allocated the same way the
+    //   expert arena is (let ggml-vulkan allocate; never import host memory --
+    //   finding S7).
+    {
+        size_t lay_max = 0;
+        for (auto & kv : g_dn_meta) {
+            if (!kv.second.ready) continue;
+            size_t t = 0;
+            for (const auto & w : kv.second.w) if (w.valid) t += (size_t) w.bytes;
+            lay_max = std::max(lay_max, t);
+        }
+        g_dn_bytes_per = (lay_max + 4095) & ~(size_t) 4095;
+        ggml_backend_buffer_type_t buft = ggml_backend_vk_buffer_type
+                                            ? ggml_backend_vk_buffer_type(0) : nullptr;
+        bool ok = buft != nullptr && g_dn_bytes_per > 0;
+        for (int i = 0; ok && i < g_dn_nbuf; ++i) {
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, g_dn_bytes_per);
+            if (!b) { ok = false; break; }
+            void * hp = ggml_backend_vk_buffer_host_ptr
+                          ? ggml_backend_vk_buffer_host_ptr(b, 0) : nullptr;
+            if (!hp) {
+                ggml_backend_buffer_free(b);
+                fprintf(stderr, "moestream: [dense] the arena requires a UMA device\n");
+                ok = false; break;
+            }
+            g_dn_buf.push_back(b);
+            g_dn_host.push_back(hp);
+        }
+        g_dn_resident.assign(g_dn_nbuf, -1);
+        if (ok) {
+            size_t n_t = 0;
+            for (const auto & kv : g_dn_meta) n_t += kv.second.w.size();
+            // Sized from the real count. It used to assume three weights per
+            // layer, which was true only while this streamed the FFN alone;
+            // adding attention and SSM overflowed the context and tripped
+            // GGML_ASSERT(obj_new) during load.
+            struct ggml_init_params ip = {
+                ggml_tensor_overhead() * (n_t + 16), nullptr, true };
+            g_dn_ctx = ggml_init(ip);
+            ok = g_dn_ctx != nullptr;
+            for (auto & kv : g_dn_meta) {
+                if (!ok) break;
+                if (!kv.second.ready) continue;
+                const int il = kv.first;
+                const size_t bi = (size_t) (il % g_dn_nbuf);
+                uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(g_dn_buf[bi]);
+                DenseLayer v; uint64_t off = 0;
+                v.w.resize(kv.second.w.size());
+                for (size_t r = 0; r < kv.second.w.size() && ok; ++r) {
+                    const DenseInfo & m = kv.second.w[r];
+                    if (!m.valid) continue;
+                    ggml_tensor * t = ggml_new_tensor_2d(g_dn_ctx, (ggml_type) m.type, m.ne0, m.ne1);
+                    if (!t) { ok = false; break; }
+                    if (ggml_backend_tensor_alloc(g_dn_buf[bi], t, base + off)
+                            != GGML_STATUS_SUCCESS) { ok = false; break; }
+                    v.w[r] = m; v.w[r].t = t; v.w[r].arena_off = off;
+                    off += m.bytes;
+                }
+                v.ready = ok && !v.w.empty();
+                if (v.ready) g_dn_view[il] = v;
+            }
+            g_dn_ready = ok && !g_dn_view.empty();
+        }
+        if (!g_dn_ready) {
+            for (auto b : g_dn_buf) ggml_backend_buffer_free(b);
+            g_dn_buf.clear(); g_dn_host.clear(); g_dn_view.clear();
+        }
+        const double streamed_gib = [&]{
+            double t = 0; for (auto & kv : g_dn_meta) for (const auto & w : kv.second.w)
+                if (w.valid) t += (double) w.bytes;
+            return t / 1073741824.0; }();
+        fprintf(stderr,
+            "moestream: [dense] arena %s (%d x %.0f MiB); streaming %.2f GiB of FFN "
+            "across %d layers, %.2f GiB/token\n",
+            g_dn_ready ? "ENABLED" : "FAILED", g_dn_nbuf, g_dn_bytes_per / 1048576.0,
+            streamed_gib, (int) g_dn_view.size(), streamed_gib);
+    }
+}
+
 void finalize(const char * gguf_path) {
     if (!enabled() || !g_cache.empty()) return;
+    finalize_dense(gguf_path);
     if (g_layers.empty()) {
+        if (g_dn_ready) {
+            fprintf(stderr, "moestream: no expert tensors; running as a dense "
+                            "streaming model (FFN only)\n");
+            return;                       // dense path is live; stay enabled
+        }
         fprintf(stderr, "moestream: no expert tensors found, disabling\n");
         g_enabled = false; return;
     }
@@ -1187,6 +1642,27 @@ void finalize(const char * gguf_path) {
             fprintf(stderr, "moestream: prefill async prefetch = %s\n",
                     (g_pf_async && g_pf_nbuf >= 2) ? "on" : "off");
     }
+    // Whether drafting pays is a property of the machine and the model together,
+    // not of Mixture-of-Experts as such. Measured here (S42): a MoE decode pass
+    // costs 3.5x more at width 6 than at width 1, because the tokens in it want
+    // different experts, while a dense pass is flat; and one drafted token costs
+    // ~53% of a MoE forward pass against ~11% of a dense one. Both penalties land
+    // on MoE. On a machine where a decode pass is far more expensive, both shrink
+    // -- which is why this warns rather than refuses, and why SPEC_DECODING=learn
+    // measures it instead of assuming.
+    if (!g_layers.empty()) {
+        const char * sd = getenv("SPEC_DECODING");
+        if (sd && *sd && strcmp(sd, "learn") != 0)
+            fprintf(stderr,
+                "moestream: NOTE speculative decoding is pinned on, and this is a MoE model.\n"
+                "moestream:      Measured here it loses: 48.6 to 51.1 ms/token at the best\n"
+                "moestream:      setting found, and 65%% worse at llama.cpp's own defaults.\n"
+                "moestream:      A MoE verification pass gets dearer as it widens, and the\n"
+                "moestream:      draft head costs about half a forward pass (findings/S42).\n"
+                "moestream:      On a bigger GPU the balance moves the other way, so\n"
+                "moestream:      SPEC_DECODING=learn measures it on your machine instead --\n"
+                "moestream:      with 'off' among the candidates.\n");
+    }
     if (g_drop_from < (int) n_layer)
         fprintf(stderr, "moestream: TURBO enabled from layer %d "
                         "(misses are dropped, not fetched)\n", g_drop_from);
@@ -1267,6 +1743,7 @@ void finalize(const char * gguf_path) {
             });
         }
     }
+
 }
 
 static void ensure_zero_slot() {
@@ -1844,6 +2321,157 @@ static void pf_kick(int il) {
 //   "load completes -> mul_mat_id runs".
 //   The input (ids) lives on Vulkan, so the scheduler synchronizes the GPU
 //   before the CPU op. This is the same mechanism as the decode-side remap.
+// ---------------------------------------------------------------------------
+// Dense FFN arena
+// ---------------------------------------------------------------------------
+//   One arena per buffer, each holding a single layer's gate+up+down. Buffer
+//   il % nbuf holds layer il, so with nbuf=2 the layer being computed and the
+//   layer being prefetched never share a buffer.
+static size_t dense_read_range(int fd, uint64_t off, uint8_t * dst, size_t bytes, int nth) {
+    if (nth <= 1) {
+        size_t left = bytes, o = 0;
+        while (left) {
+            ssize_t r = pread(fd, dst + o, left, (off_t) (off + o));
+            if (r <= 0) break;
+            o += (size_t) r; left -= (size_t) r;
+        }
+        return o;
+    }
+    // Large contiguous reads split evenly; this is a very different shape from
+    // the scattered 1.4 MiB expert reads run_reads_parallel is tuned for.
+    const size_t chunk = (bytes + (size_t) nth - 1) / (size_t) nth;
+    std::atomic<size_t> total{0};
+    std::vector<std::thread> th; th.reserve((size_t) nth);
+    for (int i = 0; i < nth; ++i) {
+        const size_t beg = (size_t) i * chunk;
+        if (beg >= bytes) break;
+        const size_t len = std::min(chunk, bytes - beg);
+        th.emplace_back([fd, off, dst, beg, len, &total] {
+            size_t left = len, o = 0;
+            while (left) {
+                ssize_t r = pread(fd, dst + beg + o, left, (off_t) (off + beg + o));
+                if (r <= 0) break;
+                o += (size_t) r; left -= (size_t) r;
+            }
+            total += o;
+        });
+    }
+    for (auto & t : th) t.join();
+    return total.load();
+}
+
+// Fill the arena for layer il. Returns false if it was already resident.
+static int  dn_threads_for_this_load();
+static void dn_threads_record(size_t bytes, double dt);
+
+static bool dense_load_layer(int il) {
+    if (!g_dn_ready) return false;
+    const size_t bi = (size_t) (il % g_dn_nbuf);
+    if (g_dn_resident[bi] == il) { g_dn_hits++; return false; }
+    auto mit = g_dn_meta.find(il);
+    auto vit = g_dn_view.find(il);
+    if (mit == g_dn_meta.end() || vit == g_dn_view.end()) return false;
+    const double t0 = now_s();
+    if (bi >= g_dn_host.size() || !g_dn_host[bi]) return false;
+    const int nth = dn_threads_for_this_load();
+    size_t layer_bytes = 0;
+    for (size_t r = 0; r < mit->second.w.size() && r < vit->second.w.size(); ++r) {
+        const DenseInfo & m = mit->second.w[r];
+        const DenseInfo & v = vit->second.w[r];
+        if (!m.valid || !v.t) continue;
+        const size_t fi = (size_t) m.file_idx;
+        if (fi >= g_fds.size() || g_fds[fi] < 0) {
+            static bool warned = false;
+            if (!warned) { warned = true;
+                fprintf(stderr, "moestream: [dense] [BUG] no fd for shard %zu; "
+                                "weights are garbage\n", fi); }
+            continue;
+        }
+        uint8_t * hp = (uint8_t *) g_dn_host[bi] + v.arena_off;
+        const size_t got = dense_read_range(g_fds[fi], m.file_offset, hp,
+                                            (size_t) m.bytes, nth);
+        layer_bytes += (size_t) m.bytes;
+        if (got != (size_t) m.bytes) {
+            static bool warned = false;
+            if (!warned) { warned = true;
+                fprintf(stderr, "moestream: [dense] [BUG] short read on layer %d slot %zu "
+                                "(%zu of %llu bytes); output will be wrong\n",
+                        il, r, got, (unsigned long long) m.bytes); }
+        }
+        g_dn_read_bytes += m.bytes;
+    }
+    g_dn_resident[bi] = il;
+    g_dn_loads++;
+    const double dt = now_s() - t0;
+    g_dn_t_read += dt;
+    dn_threads_record(layer_bytes, dt);
+    return true;
+}
+
+// ---- dense read threads ----
+//   Fixed at 4, and deliberately not auto-tuned.
+//
+//   A bandwidth-based tuner was built here, in the shape of the [io] tuner
+//   above, and it settled on 8 threads at 15.51 GB/s against 14.30 at 4. It was
+//   wrong. Measured end to end (finding S29), 4 threads decode in 656.8 ms and
+//   8 in 674.4, and with the tuner active decode came out at 685.3 against the
+//   676 the fixed value gives.
+//
+//   The reason is already in RESULTS.md 10.12: time spent inside the read call
+//   and the cost the read imposes are different quantities, and they disagreed
+//   by 1.6x on the expert path for the same reason. More reader threads finish
+//   the read sooner and leave the compute that follows contending for memory
+//   bandwidth. Optimising the first makes the second worse.
+//
+//   Auto-tuning this properly needs decode wall time as the objective, not read
+//   bandwidth. Until something measures that, a value from an end-to-end
+//   measurement beats a tuner optimising the wrong thing.
+static int dn_threads_for_this_load() { return g_dn_th; }
+static void dn_threads_record(size_t, double) {}
+
+static void dn_wait() {
+    if (g_dn_thread.joinable()) g_dn_thread.join();
+    g_dn_inflight = -1;
+}
+
+//   Nothing to predict: layer il+1 is always layer il+1. This is the prefetch
+//   that could never work for MoE (findings N2/S10/S11, §10.14), because there
+//   the ids do not exist until the previous layer has run.
+static void dn_kick(int il) {
+    if (!g_dn_ready || g_dn_nbuf < 2) return;
+    if (!dense_streamed_layer(il) || il >= g_dn_nlayer) return;
+    dn_wait();
+    g_dn_inflight = il;
+    g_dn_thread = std::thread([il] { dense_load_layer(il); });
+}
+
+static void ms_dnload_fn(ggml_tensor * dst, const ggml_tensor * a,
+                         int ith, int nth, void * ud) {
+    (void) nth;
+    if (ith != 0) return;
+    const int il = (int) ((intptr_t) ud & 0xFFFF);
+    if (g_dn_ready) {
+        const bool was_mine = (g_dn_inflight == il);
+        dn_wait();
+        dense_load_layer(il);              // no-op if the prefetch already did it
+        if (was_mine) g_dn_pf_hit++; else g_dn_pf_miss++;
+        dn_kick(il + 1);
+    }
+    // Pass the hidden state through unchanged; the FFN consuming it is what
+    // orders "arena filled -> mul_mat runs".
+    if (!a->data || !dst->data) return;
+    if (ggml_is_contiguous(a) && ggml_is_contiguous(dst)) {
+        memcpy(dst->data, a->data, ggml_nbytes(a));
+    } else {
+        const size_t rb = (size_t) a->ne[0] * ggml_type_size(a->type) / ggml_blck_size(a->type);
+        for (int64_t i3 = 0; i3 < a->ne[3]; ++i3)
+        for (int64_t i2 = 0; i2 < a->ne[2]; ++i2)
+        for (int64_t i1 = 0; i1 < a->ne[1]; ++i1)
+            memcpy((char *) dst->data + i3*dst->nb[3] + i2*dst->nb[2] + i1*dst->nb[1],
+                   (const char *) a->data + i3*a->nb[3] + i2*a->nb[2] + i1*a->nb[1], rb);
+    }
+}
+
 static void ms_pfload_fn(ggml_tensor * dst, const ggml_tensor * a,
                          int ith, int nth, void * ud) {
     (void) nth;
@@ -1968,6 +2596,51 @@ ggml_tensor * build_remap2(ggml_context * ctx, ggml_tensor * ids,
                         "(%lld floats) -- diagnostic only, measures P2's sync cost\n",
                 (long long) ggml_nelements(hidden)); }
     return ggml_map_custom2(ctx, ids, hidden, ms_probe_fn, 1, (void *) pack_ud(il, 0, 1));
+}
+
+// Returns the arena-backed weight for a streamed dense layer, or nullptr when
+// this layer is resident (or dense streaming is off), in which case the caller
+// keeps llama.cpp's own tensor and nothing changes.
+// The dense arena has to exist before the FIRST graph is built, because
+// build_ffn substitutes its tensors there. The expert path can initialise
+// lazily from remap_exec at execution time; dense has no such op, and
+// llama.cpp calls graph_reserve() during model load, so waiting would hand
+// mul_mat the one-row stub (GGML_ASSERT ggml_can_mul_mat).
+//
+// The warning against running finalize() during graph construction is about
+// writing to model tensors that are not allocated yet (the zero-slot fill).
+// finalize_dense touches none: it opens fds and allocates its own buffers and
+// its own tensors in its own context.
+static void dense_ensure() {
+    if (!g_dn_done && enabled() && g_dn_seen) finalize_dense(g_path.c_str());
+}
+
+// Look a weight up by the pointer llama.cpp handed the graph. Returns the
+// arena-backed replacement, or nullptr when this weight is not streamed.
+ggml_tensor * dense_ffn(int il, int role) {
+    dense_ensure();
+    if (!enabled() || !g_dn_ready) return nullptr;
+    if (role < 0 || role > 2) return nullptr;
+    auto it = g_dn_view.find(il);
+    if (it == g_dn_view.end() || !it->second.ready) return nullptr;
+    // w is filled in load order, which for the FFN-only claim is exactly the
+    // order the three roles appear in the file. Match on the recorded role.
+    for (const auto & e : it->second.w) if (e.valid && e.role == role) return e.t;
+    return nullptr;
+}
+
+bool dense_active() { dense_ensure(); return enabled() && g_dn_ready; }
+
+// One load op per layer, not per weight. Graph construction walks layers in
+// order, so emitting only on the first weight of a new layer gives exactly one
+// CPU<->GPU handoff per streamed layer instead of one per matrix.
+ggml_tensor * build_dense_load(ggml_context * ctx, ggml_tensor * cur, int il) {
+    if (!enabled() || !g_dn_ready) return cur;
+    static int last_il = -1;
+    static const ggml_context * last_ctx = nullptr;
+    if (ctx == last_ctx && il == last_il) return cur;
+    last_ctx = ctx; last_il = il;
+    return ggml_map_custom1(ctx, cur, ms_dnload_fn, 1, (void *) pack_ud(il, 0, 1));
 }
 
 ggml_tensor * build_prefill_load(ggml_context * ctx, ggml_tensor * ids, int il) {
@@ -2392,6 +3065,34 @@ void report() {
         g_u_n ? double(g_u_total)/double(g_u_n) : 0.0,
         (g_u_n && !g_layers.empty()) ? 100.0*double(g_u_total)/double(g_u_n)
                                        /double(g_layers.begin()->second.gate.n_expert) : 0.0);
+    if (g_dn_ready && g_dn_learn && g_tokens > 0 && g_dn_read_bytes > 0) {
+        // Dense has no knee to learn. Finding S29 measured decode cost as
+        // linear in bytes streamed, so there is no interior optimum the way the
+        // expert cache's miss-ratio curve has one -- "auto" already picks the
+        // only defensible point (stream the least that fits). What is worth
+        // learning is the exchange RATE on this machine, so the operator can
+        // price any other point themselves.
+        const double gib_per_tok = double(g_dn_read_bytes) / 1073741824.0 / double(g_tokens);
+        fprintf(stderr,
+            "moestream: [dense] [learn] %.2f GiB/token streamed over %llu tokens\n"
+            "moestream: [dense] [learn]   read %.2f s at %.2f GB/s; prefetch hid %llu of %llu layer loads\n"
+            "moestream: [dense] [learn]   there is no knee here: cost is linear in bytes streamed,\n"
+            "moestream: [dense] [learn]   so auto streams the least that fits and that is the whole policy\n",
+            gib_per_tok, (unsigned long long) g_tokens,
+            g_dn_t_read, g_dn_t_read > 0 ? g_dn_read_bytes / g_dn_t_read / 1e9 : 0.0,
+            (unsigned long long) g_dn_pf_hit,
+            (unsigned long long) (g_dn_pf_hit + g_dn_pf_miss));
+    }
+    if (g_dn_ready)
+        fprintf(stderr,
+            "moestream: [dense] layers %d-%d streamed (%zu), %d resident\n"
+            "moestream: [dense]   arena loads %llu, reuse hits %llu, %.2f GiB read in %.2f s (%.2f GB/s)\n"
+            "moestream: [dense]   prefetch hit %llu / miss %llu\n",
+            g_dn_first, g_dn_nlayer - 1, g_dn_view.size(), g_dn_first,
+            (unsigned long long) g_dn_loads, (unsigned long long) g_dn_hits,
+            g_dn_read_bytes / 1073741824.0, g_dn_t_read,
+            g_dn_t_read > 0 ? g_dn_read_bytes / g_dn_t_read / 1e9 : 0.0,
+            (unsigned long long) g_dn_pf_hit, (unsigned long long) g_dn_pf_miss);
     mrc_report();
     ub_report();
     prefetch_verify();

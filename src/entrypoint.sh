@@ -124,6 +124,96 @@ if [[ "${MOESTREAM:-0}" != "0" ]]; then
   echo "[moestream] streaming enabled (cache_frac=${MOESTREAM_CACHE_FRAC:-0.25}, ubatch=$UBATCH, arena=${MOESTREAM_PREFILL_ARENA:-1})"
 fi
 
+# ---- speculative decoding, learned ------------------------------------------
+#   SPEC_DECODING=learn asks two questions the operator should not have to:
+#   whether this model can self-speculate at all, and how many tokens to draft.
+#
+#   The first is llama.cpp's to answer -- moestream-spec-probe links its common
+#   library and calls common_speculative_types_from_gguf(), so the rule is not
+#   copied here and follows upstream.
+#
+#   The second has to be measured, and the honest number comes from llama.cpp
+#   too: the server's own `llamacpp:predicted_tokens_seconds` counts tokens it
+#   actually produced, so a rejected draft is already subtracted. Nothing this
+#   runtime can see would do that -- it observes batches, not acceptances, and
+#   dividing by tokens *processed* would rank a wasteful setting as a fast one.
+#
+#   Why it needs measuring at all: drafting costs a forward pass through the
+#   model's own prediction head per drafted token, and that cost is fixed while
+#   the saving is a fraction of the target pass. On a model whose decode is slow
+#   the head disappears into it; on a fast one it dominates. Measured on this
+#   machine: 2.7x faster on a streamed dense model, and a 65% loss at llama.cpp's
+#   own defaults on a fast MoE one (docs/findings/S42).
+if [[ "${SPEC_DECODING:-}" == "learn" ]]; then
+  set +e
+  ST="${MOESTREAM_STATE_DIR:-/state}"
+  SPEC_TSV="$ST/spec.tsv"; [[ -f "$SPEC_TSV" ]] || SPEC_TSV_R=/dev/null
+  SPEC_TSV_R="${SPEC_TSV_R:-$SPEC_TSV}"
+  TYPES=$(/usr/local/bin/moestream-spec-probe "$MODEL_PATH" 2>/dev/null | paste -sd, -)
+  if [[ -z "$TYPES" ]]; then
+    echo "[moestream] SPEC_DECODING=learn: llama.cpp reports this model cannot"
+    echo "[moestream]   self-speculate; running without it. Nothing to learn."
+    SPEC_DECODING=""
+  else
+    # Both the streaming configuration and the concurrency change the answer, so
+    # rows are keyed by both. Concurrency matters most: batching and drafting are
+    # two ways to put more tokens in one pass, and they do not add. Measured on a
+    # streamed dense model, drafting is worth 2.08x at one request and *costs*
+    # 34% at four, for 3.6 GiB more (docs/findings/S45). A row learned at one
+    # concurrency must never be applied at another.
+    SKEY="${MOESTREAM_CACHE_FRAC:-na}/${MOESTREAM_DENSE_FRAC:-na}/${MOESTREAM:-1}/p${N_PARALLEL:-1}"
+    SN=""
+    for c in ${SPEC_CANDIDATES:-off 1 2 3 5}; do
+      awk -F'	' -v m="$MODEL_FILE" -v k="$SKEY" -v n="$c"           '$1==m && $2==k && $3==n {found=1} END{exit found}' "$SPEC_TSV_R"         && { SN="$c"; echo "[moestream] SPEC_DECODING=learn: measuring n_max=$c ($TYPES)"; break; }
+    done
+    if [[ -z "$SN" ]]; then
+      read -r SN SRATE <<< "$(awk -F'	' -v m="$MODEL_FILE" -v k="$SKEY"           '$1==m && $2==k && $4+0>0 {if ($4+0>b) {b=$4+0; p=$3}} END{if (p) print p, b}' "$SPEC_TSV_R")"
+      [[ -n "$SN" ]] && echo "[moestream] SPEC_DECODING=learn: using n_max=$SN ($SRATE tok/s generation)"
+    fi
+    [[ -z "$SN" ]] && SN=off
+    if [[ "$SN" == "off" ]]; then
+      SPEC_DECODING=""
+    else
+      # p-min matters more than n_max on a fast model: it stops drafting when the
+      # head is unsure, and without it llama.cpp's default drafts regardless.
+      SPEC_DECODING="--spec-type $TYPES --spec-draft-n-max $SN --spec-draft-p-min ${SPEC_P_MIN:-0.7}"
+    fi
+    # Record what this run achieves, from the server's own metrics. Runs in the
+    # background because the entrypoint execs the server and never returns.
+    # The image has neither curl nor wget -- compose.yaml's healthcheck says so
+    # and uses python3 for the same reason. Written with curl first, which meant
+    # this recorder silently never fired and the whole learn loop was inert.
+    fetch() { python3 -c "
+import sys,urllib.request
+try: sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:8080/'+sys.argv[1],timeout=5).read().decode())
+except Exception: sys.exit(1)" "$1" 2>/dev/null; }
+    (
+      for _ in $(seq 1 400); do fetch health >/dev/null 2>&1 && break; sleep 3; done
+      for _ in $(seq 1 600); do
+        M=$(fetch metrics)
+        NG=$(printf '%s' "$M" | awk '/^llamacpp:tokens_predicted_total/{print $2}')
+        RATE=$(printf '%s' "$M" | awk '/^llamacpp:predicted_tokens_seconds/{print $2}')
+        if [[ -n "$NG" && "${NG%.*}" -ge ${SPEC_MIN_TOKENS:-200} && -n "$RATE" ]]; then
+          mkdir -p "$ST" 2>/dev/null
+          T=$(mktemp "$ST/.spec.XXXXXX" 2>/dev/null) || exit 0
+          grep -v -P "^\Q$MODEL_FILE\E	\Q$SKEY\E	$SN	" "$SPEC_TSV" 2>/dev/null > "$T"
+          printf '%s	%s	%s	%.1f
+' "$MODEL_FILE" "$SKEY" "$SN" "$RATE" >> "$T"
+          # mktemp creates 600; the C++ side writes its state files 644 and the
+          # host user has to be able to read them. Match, or ./state/ fills up
+          # with rows nobody outside the container can inspect.
+          chmod 644 "$T" 2>/dev/null
+          mv -f "$T" "$SPEC_TSV" 2>/dev/null
+          echo "[moestream] [learn] speculation n_max=$SN -> $RATE tok/s generation" >&2
+          exit 0
+        fi
+        sleep 20
+      done
+    ) &
+  fi
+  set -e
+fi
+
 # ---- sampling ---------------------------------------------------------------
 # Pass through only what was explicitly set. Anything omitted falls back to the
 # model's own defaults from the GGUF. Hardcoding values here would carry one

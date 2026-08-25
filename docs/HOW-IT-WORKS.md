@@ -20,7 +20,7 @@ Other approaches to the same goal exist. What differs is **what gets sacrificed*
 Measured: memory **17.3 GB → 7.4 GB (a 57% cut)** while keeping **70–80%** of
 the speed.
 
-On intelligence, the honest answer splits in two (§8 has the detail):
+On intelligence, the honest answer splits in two (§9 has the detail):
 
 - **Degradation from the streaming itself measured as zero.** With few slots
   (fetching from SSD constantly) and with slots for everyone (never fetching at
@@ -72,6 +72,12 @@ This is the starting point.
 
 Every token uses **all** the weights. All 34.6 billion numbers get read. Hence
 all of them must be in memory.
+
+> **They still have to be read — but not all at once.** MoEStream streams a
+> dense model's FFN one layer at a time, which cuts memory by 56% at no cost to
+> accuracy. Generation pays 3.2x for it; prompt processing pays nothing, because
+> a forward pass reads the same weights whether it carries one token or a
+> thousand. See [Dense models](../README.md#dense-models-too).
 
 ```
 generate 1 token -> use all 34.6 billion numbers
@@ -378,7 +384,7 @@ plain llama.cpp with all weights resident.
 That is not the same as "the numbers are identical". When generating, the model
 picks **the highest-scoring candidate**, so scores can differ slightly without
 changing which token wins. Matching text is strong evidence but **not proof of
-numerical identity** (§8).
+numerical identity** (§9).
 
 ### Where that landed
 
@@ -440,7 +446,73 @@ seat count moves, old measurements stop matching and are simply taken again.
 
 ---
 
-## 7. A record of failures — the most useful part
+## 7. The claim in this document that turned out to be wrong
+
+For most of this project's life, the answer to "does it help an ordinary dense
+model?" was **no**, and the reasoning looked airtight. An MoE model is mostly
+experts, and only a few experts run per token, so most of the file is idle at
+any moment and can live on disk. A dense model has no idle part. Every weight
+participates in every token. There is nothing to leave behind.
+
+The reasoning is correct. The conclusion drawn from it was not.
+
+### What was actually being assumed
+
+"Nothing to leave behind" quietly means "nothing can be **absent**". But
+streaming does not require a weight to be absent from the *computation* — only
+from *memory*, and only until the moment it is needed. A dense model's
+feed-forward block is used once per layer, in a known order, one layer at a
+time. Layer 40's feed-forward weights are not needed while layer 3 is running.
+
+So they can be read then. The model computes exactly the same thing; the bytes
+simply arrive later and leave sooner.
+
+Built and measured, on a 27B dense model: **memory 16.18 GiB → 7.50 GiB**, with
+perplexity identical to four decimal places. Not "close". Identical — because
+nothing about the arithmetic changed.
+
+### What it costs, and the law underneath
+
+Generation went from 208 to 647 milliseconds per token — about **3x**. That is a
+serious price, and much worse than the MoE case, which is about 1.3x.
+
+The reason those two numbers differ turns out to be the single most useful thing
+this project learned, and it is one sentence:
+
+> **A technique pays exactly to the extent that a pass's read volume does not
+> grow with the number of tokens in it.**
+
+Work through what that means for each kind of model.
+
+- **Dense.** A pass over the feed-forward weights reads the same bytes whether
+  you are computing one token or sixteen. Put sixteen requests in the batch and
+  the read cost is *divided by sixteen*. Measured: the penalty falls from 3.15x
+  at one request to **1.20x at sixteen**.
+- **MoE.** A pass reads whichever experts the tokens in it happen to want. Two
+  tokens usually want different experts, so the bytes read **grow** with the
+  batch. The same trick barely helps: 1.60x to 1.32x.
+
+The same law explains something that had been filed as a separate mystery.
+Speculative decoding — guessing several tokens and checking them in one pass —
+*costs* an MoE model while *gaining* a dense model 2.29x. It is not two
+phenomena. It is one, seen from both sides: speculation puts more tokens in a
+pass, and only the dense model's read volume refuses to grow with them.
+
+### Why the wrong conclusion survived so long
+
+Nobody measured it. The argument was clean, it matched the folklore, and it
+pointed away from work rather than toward it. A claim shaped like that is the
+most dangerous kind, because there is no failing test to trip over — the feature
+simply never gets built, and the reason it was not built never gets checked.
+
+The correction is written into the project's own record: `docs/RESULTS.md` §14
+carries the row **"dense models — overturned"**, next to the rows for ideas that
+were tried and rejected. Both kinds of entry cost the same to make. Only one of
+them is comfortable to write.
+
+---
+
+## 8. A record of failures — the most useful part
 
 This repository keeps **everything that did not work**. These were all actually
 hit, and all of them generalise.
@@ -613,7 +685,7 @@ it.
 
 ---
 
-## 8. So what is the actual trade-off
+## 9. So what is the actual trade-off
 
 Back to the table at the top.
 
@@ -743,22 +815,27 @@ And what matters most: **neither of them starts on this machine otherwise.**
 
 ---
 
-## 9. The numbers
+## 10. The numbers
 
-All measured (2026-08-06 to 08-08, Ryzen 7 8745HS + Radeon 780M + PCIe4 NVMe,
-30.6 GB RAM, **23.5 GB reachable by the GPU**).
+All measured on Ryzen 7 8745HS + Radeon 780M + PCIe4 NVMe, 30.6 GB RAM,
+**23.5 GB reachable by the GPU**; speed and memory re-measured 2026-08-24 on
+llama.cpp `b0539c43`, perplexity carried over from the earlier commit.
 
 ### On the 35B model
 
 | Metric | plain llama.cpp | MoEStream | |
 |---|---:|---:|---|
-| memory | 17.29 GB | **7.44 GB** | **−57%** |
-| generation | 42 ms/tok | 59 ms/tok | 71% |
-| prompt processing | 296 tok/s | 243 tok/s | 82% |
+| memory | 17.77 GB | **7.93 GB** | **−55%** |
+| generation | 23.4 tok/s | 16.5 tok/s | −29% |
+| prompt processing | 256.2 tok/s | 239.4 tok/s | −7% |
 | quality (PPL, lower is better) | 4.4400 | 4.4494 | **+0.21%** |
 | generated text | — | not one character differs | |
 
-Quality was re-tested on a separate corpus (§8):
+*(Re-measured 2026-08-24 on llama.cpp `b0539c43`. Prompt processing reads 93% of
+plain where it read 82% on the older commit — because plain llama.cpp's own
+prefill fell 13%, not because streaming improved.)*
+
+Quality was re-tested on a separate corpus (§9):
 
 | | PPL | Difference |
 |---|---:|---:|
@@ -771,15 +848,15 @@ what remains is a **+0.24% difference from plain llama.cpp** caused by
 arithmetic ordering. With zero measurement variance, that difference is not
 noise.
 
-### Across four models
+### Across four MoE models
 
 | | 35B | 80B class | 115B class | **120B** |
 |---|---:|---:|---:|---:|
 | model size | 16.9 GB | 36.5 GB | 54.7 GB | **58.5 GB** |
-| plain llama.cpp | runs (17.3 GB) | **does not fit** | **does not fit** | **does not fit** |
-| **MoEStream memory** | **7.4 GB** | **13.2 GB** | **18.5 GB** | **14.5 GB** |
-| generation | **17.0 tok/s** | **9.8 tok/s** | 3.1 tok/s | 3.9 tok/s |
-| prompt processing | 243 tok/s | 151 tok/s | 80 tok/s | 107 tok/s |
+| plain llama.cpp | runs (17.8 GB) | **does not fit** | **does not fit** | **does not fit** |
+| **MoEStream memory** | **7.9 GB** | **13.4 GB** | **18.8 GB** | **14.9 GB** |
+| generation | **16.5 tok/s** | **14.8 tok/s** | 3.1 tok/s | 3.8 tok/s |
+| prompt processing | 239 tok/s | 149 tok/s | 76 tok/s | 92 tok/s |
 
 Only the 35B can be compared, because the others **do not start under plain
 llama.cpp** (they exceed the GPU's 23.5 GB). So the question here is not "is it
@@ -789,6 +866,26 @@ The 80B at 13 GB and 9.8 tok/s is the most practically useful result. The 120B
 is the most striking: it is **larger** than the 115B-class model yet uses less
 memory and runs faster, because it routes to 4 experts per token instead of 10.
 **What costs you is `top_k`, not model size.**
+
+### On dense models
+
+Added later, after §7 established that the "dense cannot benefit" reasoning was
+wrong. Measured on Qwen3.8-27B, one request at a time:
+
+| Metric | plain llama.cpp | MoEStream | |
+|---|---:|---:|---|
+| memory | 16.49 GB | **7.81 GB** | **−53%** |
+| prompt processing | 69.1 tok/s | 67.0 tok/s | **−3%** |
+| generation | 4.69 tok/s | 1.28 tok/s | −73% |
+| generation, both sides speculating | 8.93 tok/s | 3.79 tok/s | −58% |
+| quality (PPL) | identical to four decimals | | |
+
+And the same generation cost with more requests in flight, which is what decides
+whether dense streaming is cheap or expensive:
+
+| requests at once | 1 | 4 | 8 | 16 |
+|---|---:|---:|---:|---:|
+| cost vs. plain llama.cpp | 3.15x | 1.90x | 1.62x | **1.20x** |
 
 ### The main breakdown
 
@@ -801,12 +898,12 @@ memory and runs faster, because it routes to 4 experts per token instead of 10.
 | CPU↔GPU synchronization per token | 2.2 ms (11.4 originally; reduced) |
 | SSD reads per token | 7.8–12.5 ms (0.5 originally; the ratio inverted) |
 | effective SSD speed | 4.48 GB/s |
-| product code | 3156 lines |
+| product code | 4541 lines |
 | code added to llama.cpp | 4 files, 5 blocks, ~95 lines |
 
 ---
 
-## 10. Where to read more
+## 11. Where to read more
 
 | Document | Contents |
 |---|---|

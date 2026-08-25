@@ -1,0 +1,72 @@
+diff --git a/src/llama-moestream.cpp b/src/llama-moestream.cpp
+index 0ac86aa..7e57481 100644
+--- a/src/llama-moestream.cpp
++++ b/src/llama-moestream.cpp
+@@ -123,6 +123,18 @@ static uint64_t                  g_maxb     = 0;   // largest single-member size
+ //   so an all-zero block decodes to zero and the expert's contribution simply
+ //   vanishes rather than producing garbage.
+ static int      g_drop_from = 1 << 30;
++// Finding S17: a cache miss is only worth its I/O if the expert contributes.
++//   ggml_argsort_top_k orders selected_experts by descending router
++//   probability, so the position k within top_k IS the rank -- rank 0 carries
++//   a mean weight of 0.255 on Ornith, rank 7 only 0.072 (finding M0-2).
++//   Skipping a MISS at rank >= this removes read bytes; skipping a HIT would
++//   cost weight mass and save nothing, so hits are never skipped.
++//   S17 measured the trade offline: at frac=0.25 the low-rank misses are
++//   10-12% of read bytes and 0.6-0.8% of router weight mass.
++//   0 = disabled. Weights are NOT renormalised, so the surviving experts sum
++//   to less than 1 and this is a lower bound on the achievable quality.
++static int      g_skip_rank = 0;
++static uint64_t g_rank_skipped = 0;
+ static uint32_t g_zero_slot = 0;         // zero-filled slot reserved at the end of the slab
+ static uint64_t g_dropped   = 0, g_demand = 0;
+ static bool     g_zero_filled = false;
+@@ -390,6 +402,7 @@ bool enabled() {
+             g_nthreads = std::max(1, atoi(t)); g_io_auto = false;   // explicit value pins it
+         }
+         if (const char * d = getenv("MOESTREAM_DROP_FROM")) g_drop_from = atoi(d);
++        if (const char * r = getenv("MOESTREAM_SKIP_RANK")) g_skip_rank = std::max(0, atoi(r));
+         if (const char * u = getenv("MOESTREAM_MAX_UBATCH")) g_max_ubatch = std::max(1, atoi(u));
+         if (const char * t = getenv("MOESTREAM_PREFILL_THRESHOLD")) g_pf_threshold = atoi(t);
+         if (g_enabled) {
+@@ -1190,6 +1203,10 @@ void finalize(const char * gguf_path) {
+     if (g_drop_from < (int) n_layer)
+         fprintf(stderr, "moestream: TURBO enabled from layer %d "
+                         "(misses are dropped, not fetched)\n", g_drop_from);
++    if (g_skip_rank > 0)
++        fprintf(stderr, "moestream: [S17] skipping misses at top_k rank >= %d "
++                        "(weights are NOT renormalised; quality is a lower bound)\n",
++                g_skip_rank);
+ 
+     // ---- decide whether prefetching is worthwhile ----
+     {
+@@ -1460,6 +1477,15 @@ static void ms_remap_fn(ggml_tensor * dst, const ggml_tensor * a,
+                         g_dropped++;
+                         continue;
+                     }
++                    if (!hit && g_skip_rank > 0 && k >= g_skip_rank) {
++                        // Finding S17: a low-rank expert that is also a miss.
++                        // Same mechanism as drop mode, but selected by the
++                        // expert's contribution rather than by layer index.
++                        g_cache[il]->release(0, (uint32_t) e);
++                        out[(size_t) j * tk + k] = (int32_t) g_zero_slot;
++                        g_rank_skipped++;
++                        continue;
++                    }
+                     if (!hit) {
+                         if (noop_level() != 3) pend.push_back({ (uint32_t) e, slot });
+                         g_cache[il]->mark_resident(0, (uint32_t) e,
+@@ -2392,6 +2418,13 @@ void report() {
+         g_u_n ? double(g_u_total)/double(g_u_n) : 0.0,
+         (g_u_n && !g_layers.empty()) ? 100.0*double(g_u_total)/double(g_u_n)
+                                        /double(g_layers.begin()->second.gate.n_expert) : 0.0);
++    if (g_skip_rank > 0)
++        fprintf(stderr,
++            "moestream: [S17] rank skip >= %d: %llu misses skipped of %llu demands (%.2f%%)\n"
++            "moestream: [S17]   weights not renormalised -- quality is a lower bound\n",
++            g_skip_rank, (unsigned long long) g_rank_skipped,
++            (unsigned long long) g_demand,
++            g_demand ? 100.0 * double(g_rank_skipped) / double(g_demand) : 0.0);
+     mrc_report();
+     ub_report();
+     prefetch_verify();

@@ -3,9 +3,12 @@
 # ms-bench.sh — measure MoEStream in a form other people can reproduce
 #
 #   Usage:
-#     research/tools/ms-bench.sh                     # measure using the .env settings
+#     research/tools/ms-bench.sh                     # measure using the current settings
 #     research/tools/ms-bench.sh --baseline          # also A/B against MOESTREAM=0
 #     research/tools/ms-bench.sh --frac 0.25 --ub 1024
+#     research/tools/ms-bench.sh --model x.gguf --ctx 32768
+#     research/tools/ms-bench.sh --dense-frac 0.00    # a dense model's FFN
+#     research/tools/ms-bench.sh --spec              # with speculative decoding
 #
 #   This script never reports speed on its own. Alongside it, it always reports
 #   (a) the environment, (b) the actual slot count, (c) the page-cache state and
@@ -16,12 +19,16 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."   # repo root: .env and research/bench live there
 
-FRAC=""; UB=""; BASELINE=0; PORT=18080; NAME=ms-bench
+FRAC=""; UB=""; BASELINE=0; PORT=18080; NAME=ms-bench; DFRAC=""; SPEC=0; MODEL_ARG=""; CTX_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --frac)     FRAC="$2"; shift 2 ;;
     --ub)       UB="$2";   shift 2 ;;
     --baseline) BASELINE=1; shift ;;
+    --dense-frac) DFRAC="$2"; shift 2 ;;
+    --model)    MODEL_ARG="$2"; shift 2 ;;
+    --ctx)      CTX_ARG="$2"; shift 2 ;;
+    --spec)     SPEC=1; shift ;;
     --port)     PORT="$2"; shift 2 ;;
     -h|--help)  sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -29,7 +36,20 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f .env ] || { echo "no .env found; run: cp .env.example .env" >&2; exit 1; }
-set -a; . ./.env; set +a
+set -a
+. ./.env
+# `make launch` writes its answers to .env.launcher, and compose.yaml layers that
+# file over .env. Read it here too, or this measures a different model from the
+# one actually running.
+[ -f .env.launcher ] && . ./.env.launcher
+set +a
+
+# Sourcing .env overwrites anything the caller set, so an explicit flag has to be
+# applied afterwards. Measuring a different model from the one named on the
+# command line is the kind of error that produces a whole table of wrong numbers
+# without a single visible failure.
+[ -n "$MODEL_ARG" ] && MODEL_FILE="$MODEL_ARG"
+[ -n "$CTX_ARG" ]   && CTX_SIZE="$CTX_ARG"
 [ -n "$FRAC" ] && MOESTREAM_CACHE_FRAC="$FRAC"
 [ -n "$UB" ]   && UBATCH="$UB"
 
@@ -79,6 +99,8 @@ boot() {  # $1 = MOESTREAM 0/1
     -e N_PARALLEL="${N_PARALLEL:-1}" -e FLASH_ATTN="${FLASH_ATTN:-on}" \
     -e CACHE_TYPE_K="${CACHE_TYPE_K:-q8_0}" -e CACHE_TYPE_V="${CACHE_TYPE_V:-q8_0}" \
     -e ENABLE_WEBUI=0 -e MOESTREAM="$1" -e MOESTREAM_CACHE_FRAC="${MOESTREAM_CACHE_FRAC:-0.25}" \
+    ${DFRAC:+-e MOESTREAM_DENSE_FRAC=$DFRAC} \
+    ${SPECARG:+--env-file $SPECFILE} \
     -p "$PORT":8080 moestream/server:local >/dev/null || return 1
   for i in $(seq 1 400); do
     curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
@@ -87,6 +109,24 @@ boot() {  # $1 = MOESTREAM 0/1
   done
   return 1
 }
+
+# Speculative decoding is one env var whose value contains spaces, so it cannot
+# ride on the -e word-splitting the rest uses; give it a file of its own.
+SPECFILE=""; SPECARG=""
+if [ "$SPEC" = 1 ]; then
+  SPECFILE=$(mktemp); SPECARG=1
+  TYPES=$(docker run --rm -v "$MODEL_DIR":/models:ro \
+      --entrypoint /usr/local/bin/moestream-spec-probe moestream/server:local \
+      "/models/$MODEL_FILE" 2>/dev/null | paste -sd, -)
+  if [ -z "$TYPES" ]; then
+    echo "  --spec: llama.cpp reports this model cannot self-speculate; ignoring"
+    SPECARG=""; rm -f "$SPECFILE"; SPECFILE=""
+  else
+    echo "SPEC_DECODING=--spec-type $TYPES --spec-draft-n-max 3 --spec-draft-p-min 0.7" > "$SPECFILE"
+    echo "  --spec: llama.cpp reports $TYPES"
+  fi
+fi
+trap '[ -n "$SPECFILE" ] && rm -f "$SPECFILE"' EXIT
 
 ask() { curl -s -X POST "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' -d "$1"; }
 
@@ -170,7 +210,7 @@ if [ "$BASELINE" = 1 ]; then
   if boot 0; then measure "baseline: plain llama.cpp (MOESTREAM=0)"
   else echo "### baseline: plain llama.cpp"; echo "  failed to start -- this model does not fit in this machine's memory"; echo; fi
 fi
-if boot 1; then measure "MoEStream (frac=${MOESTREAM_CACHE_FRAC}, ub=${UBATCH})"
+if boot 1; then measure "MoEStream (${DFRAC:+dense_frac=$DFRAC, }frac=${MOESTREAM_CACHE_FRAC}, ub=${UBATCH})"
 else echo "### MoEStream"; echo "  failed to start"; docker logs "$NAME" 2>&1 | tail -5; fi
 
 docker rm -f "$NAME" >/dev/null 2>&1

@@ -42,3 +42,6 @@ __pycache__/
 # versions are kept locally as the author's working copy; the published
 # documents are the English ones (docs/*.md without the .ja suffix).
 *.ja.md
+
+# written by launcher.sh
+.env.launcher

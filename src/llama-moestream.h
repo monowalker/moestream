@@ -93,6 +93,42 @@ ggml_tensor * build_remap_pass(ggml_context * ctx, ggml_tensor * ids, ggml_tenso
 // Diagnostics: identity marker op used to observe execution order
 ggml_tensor * build_marker(ggml_context * ctx, ggml_tensor * t, int il, int pass);
 
+// ---- dense FFN streaming (findings S18 / S21 / S26) ----
+//   MOESTREAM_DENSE_FRAC = auto (default) | learn | off | a fraction.
+//   "auto" picks the split from the memory budget and streams the least that
+//   still fits, so a model that already fits streams nothing and behaves
+//   exactly like plain llama.cpp. Whether a model is dense or MoE is read from
+//   the GGUF (expert_count), so nothing has to be selected by hand.
+//   A fraction keeps the first f of a dense model's layers resident
+//   and streams the rest of their FFN weights through an arena, one layer at a
+//   time. Accuracy is untouched -- the same bytes are used, they just are not
+//   all resident at once. 1.0 (default) disables it, so MoE models and
+//   unconfigured runs behave exactly as before.
+//
+//   The tail is streamed rather than the head: which layers are chosen does not
+//   change bytes/token, but with the tail streamed the resident head's compute
+//   is time the reads are hidden behind. Unlike MoE there is nothing to predict
+//   -- layer 33 is always layer 33 -- so the prefetch that never worked for
+//   experts works here.
+//
+//   Called from the loader: claim the tensor (so it is allocated as a stub and
+//   not read from the file) and record where its real bytes live.
+bool dense_claim(const char * name, int64_t n_dims, uint64_t nbytes);
+void register_dense(const char * name, const ggml_tensor * stub, uint64_t file_offset,
+                    uint64_t bytes, int file_idx, int type, int64_t ne0, int64_t ne1);
+
+//   Called during graph construction, from build_lora_mm -- the single point
+//   every per-layer weight matrix in llama.cpp passes through, which is what
+//   lets FFN, attention and SSM all be streamed with no architecture-specific
+//   code (ADR-0036). Returns the arena-backed replacement for this weight, or
+//   nullptr when it is resident and llama.cpp's own tensor should be used.
+ggml_tensor * dense_ffn(int il, int role);
+bool          dense_active();
+//   Insert the CPU op that fills the arena for layer il. It returns the hidden
+//   state unchanged, so using its output as the FFN input orders
+//   "arena filled -> mul_mat runs".
+ggml_tensor * build_dense_load(ggml_context * ctx, ggml_tensor * cur, int il);
+
 void report();
 
 } // namespace moestream

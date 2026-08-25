@@ -16,7 +16,7 @@ IMAGE_TOOL   := $(IMAGE_PREFIX)-tool:local
 SPIKE        ?= s0_slot_slab
 TOOL         ?= expert_trace
 
-.PHONY: up down logs test bench stats dev dev-vk spike spike-vk tool clean-docker images
+.PHONY: launch up down logs test bench stats dev dev-vk spike spike-vk tool clean-docker images
 
 # =============================================================================
 # Product — thin wrappers around compose.yaml
@@ -24,6 +24,12 @@ TOOL         ?= expert_trace
 ## Start the server. The render/video GIDs are host facts, so they are detected
 ## here rather than being written into .env -- a stale GID there means no GPU,
 ## and the entrypoint can only report that after the fact, not prevent it.
+## Pick a model and a use case; everything else is derived from the GGUF header
+## and this machine. Writes .env.launcher and starts. `.env` then only needs
+## MODEL_DIR and MS_PORT.
+launch:
+	@./launcher.sh
+
 up:
 	@RENDER_GID=$$(getent group render | cut -d: -f3) \
 	 VIDEO_GID=$$(getent group video  | cut -d: -f3) \
@@ -31,7 +37,7 @@ up:
 	        RENDER_GID=$$RENDER_GID VIDEO_GID=$$VIDEO_GID docker compose up -d'
 
 down:
-	docker compose down
+	@docker compose down
 
 logs:
 	docker compose logs -f

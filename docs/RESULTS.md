@@ -13,13 +13,13 @@ the primary sources in `docs/findings/`.
 ## 0. Summary
 
 Ornith-1.0-35B-UD-IQ4_NL / `frac=0.25` / `UBATCH=1024` / `CTX_SIZE=32768`
-(re-measured 2026-08-06; the full list of conditions is in §12.5)
+(re-measured 2026-08-24 on llama.cpp `b0539c43`; conditions in §12.4b)
 
-| Metric | Baseline | MoEStream 0.25 | Ratio |
+| Metric | Baseline | MoEStream 0.25 | |
 |---|---:|---:|---:|
-| **device memory** | 17.29 GiB | **7.44 GiB** | **−57%** |
-| decode | 41.5 ms/tok (24.10 tok/s) | **58.7 ms/tok (17.04 tok/s)** | **71%** |
-| prefill (13877-token real document) | 295.6 tok/s | **242.5 tok/s** | **82%** |
+| **device memory** | 17.77 GiB | **7.93 GiB** | **−55%** |
+| decode | 23.4 tok/s | **16.5 tok/s** | **−29%** |
+| prefill (13877-token real document) | 256.2 tok/s | **239.4 tok/s** | **−7%** |
 | TTFT on a continuing turn | 1.06 s | **1.34 s** | 79% |
 | quality (PPL, wiki2) | 4.4400 | **4.4494** | **+0.21%** |
 
@@ -32,8 +32,8 @@ resident (though token identity is a weaker claim than numerical identity; §8.3
 **Only Ornith can be compared against plain llama.cpp.** Qwen3-Coder-Next
 (36.5 GiB), Laguna-S-2.1 (54.7 GiB) and gpt-oss-120b (58.5 GiB) exceed this
 machine's 23.5 GiB GTT limit and **do not start**. Under MoEStream they run in
-13.15 GiB / 9.8 tok/s, 18.51 GiB / 3.1 tok/s and 14.48 GiB / 3.9 tok/s
-respectively (§12.5).
+13.44 GiB / 14.8 tok/s, 18.79 GiB / 3.1 tok/s and 14.91 GiB / 3.8 tok/s
+respectively (§12.4b).
 
 The most reusable finding in this project is not a performance number. It is
 this:
@@ -52,6 +52,23 @@ this:
 Published work in this area (Klotski, ProMoE, MoE-Infinity) is built on the
 premise that SSD bandwidth is short and clever prefetching is therefore the
 answer. At 30B class on unified memory, that premise does not hold (§4, §7).
+
+> **[Added 2026-08-23]** Two things in this document were overtaken by a later
+> round of measurement, and both are worth knowing before reading further.
+>
+> **"I/O" is two different costs sharing one name.** On Ornith-1.0, **98.7% of
+> decode reads never reach the SSD** — they are served from the page cache, and
+> the cost is a copy into GPU-visible memory rather than a device read. On a
+> model whose experts do not fit in RAM the same code pays the NVMe. Effective
+> read bandwidth differs 2.5x between the two, with no code difference
+> (`findings/S19-pagecache-share.md`).
+>
+> **Dense models are supported, and the claim that they could not be was wrong.**
+> `B_act = total size` holds per forward *pass*, not per token, so prefill
+> amortises it away. Measured on Qwen3.8-27B: **16.49 → 7.81 GiB (−53%) with
+> byte-identical output, perplexity identical to four decimals, and prompt
+> processing within 2.2% of plain llama.cpp.** Generation costs 3.2x, which is
+> the honest shape of the trade (`findings/S27-dense-streaming-impl.md`).
 
 ---
 
@@ -765,6 +782,32 @@ implementation meant we **stopped before starting on the most dangerous option**
 | baseline | 4.4400 | — |
 | MoEStream 38% | 4.4494 | **+0.21%** |
 
+### 8.0b Re-verified on the newer llama.cpp, and on the dense path (2026-08-24)
+
+Everything below was measured on `3581ba0cf`. After the default moved to
+`b0539c43` — and after a whole dense streaming path was added — quality was
+measured again, same corpus and flags as §8.1 (`research/bench/ppl.txt`, 30
+chunks, `-c 512 -b 512 -ub 512`, `ngl 99`):
+
+| | PPL |
+|---|---:|
+| Ornith-1.0, `MOESTREAM=0` | **5.0919** |
+| Ornith-1.0, `frac=0.25` | **5.1040** |
+| Qwen3.8-27B dense, `MOESTREAM=0` | **4.2000** |
+| Qwen3.8-27B dense, whole FFN streamed | **4.2000** |
+
+**The MoE figures reproduce exactly** — the same four decimals as before. Three
+weeks of upstream llama.cpp changed speed and memory (§12.4b) and did not move
+quality by a digit.
+
+**The dense figures close a hole the documentation had left open.**
+[`USAGE.md` §5](USAGE.md) listed the streaming path's perplexity as "not
+separately measured", and the dense claims elsewhere rested on that gap. It is
+measured now: streaming the entire feed-forward block changes perplexity by
+nothing at four decimal places.
+
+---
+
 ### 8.1 Re-testing — noise, or a real difference? (2026-08-07)
 
 To settle whether that +0.21% is measurement noise or systematic, the same
@@ -1043,14 +1086,16 @@ Checked and found sound:
 
 | | Lines |
 |---|---:|
-| `src/llama-moestream.{h,cpp}` | 2498 |
+| `src/llama-moestream.{h,cpp}` | 3227 |
 | `src/expert_cache.{hpp,cpp}` | 425 |
-| `src/apply.py` (the llama.cpp patch) | 255 |
-| `src/entrypoint.sh` | ~175 |
+| `src/apply.py` (the llama.cpp patch) | 298 |
+| `src/entrypoint.sh` | 175 |
+| `launcher.sh` (the interactive start-up) | 386 |
+| `src/spec_probe.cpp` (asks llama.cpp what a model supports) | 30 |
 | `research/tools/*.sh` | ~325 |
-| **product total** | **3178** |
-| spikes (verification, not shipped) | 3883 |
-| documentation | 11610 |
+| **product total** | **4541** |
+| spikes (verification, not shipped) | 6031 |
+| documentation | 15583 |
 
 > File layout was reorganised on 2026-08-06 and again on 2026-08-08.
 > `expert_cache.{hpp,cpp}` was product code sitting in an early prototype's
@@ -2359,6 +2404,101 @@ sed -i 's/^MOESTREAM=0/MOESTREAM=1/' .env && make up
 | expert distribution (§5) | `research/tools/analysis/expert_trace` → `research/tools/analysis/analyze_trace.py` |
 | I/O disabled (§3.2) | `MOESTREAM_NOOP=3` |
 
+### 12.4b Re-measured on a newer llama.cpp (2026-08-24)
+
+Everything in §12.5 below was measured against `3581ba0cf`. When the Dockerfile's
+default moved to `b0539c43`, all of it was measured again — **same machine, same
+script, same conditions, only the commit differs.** That makes this a clean
+upstream A/B rather than a re-run.
+
+| | | `3581ba0cf` | `b0539c43` | |
+|---|---|---:|---:|---|
+| **Ornith-1.0** | plain memory | 17.29 GiB | 17.77 GiB | +0.48 |
+| | plain decode | 41.5 ms/tok | 42.8 | +3.1% |
+| | plain prefill | 295.6 tok/s | **256.2** | **−13.3%** |
+| | streamed memory | 7.44 GiB | 7.93 GiB | +0.49 |
+| | streamed decode | 58.7 ms/tok | 60.7 | +3.4% |
+| | streamed prefill | 242.5 tok/s | 239.4 | −1.3% |
+| **Qwen3-Coder-Next** | memory | 13.15 GiB | 13.44 GiB | +0.29 |
+| | decode | 101.7 ms/tok | **67.8** | **−33.3%** |
+| | prefill | 150.8 tok/s | 149.2 | −1.1% |
+| **Laguna-S-2.1** | memory | 18.51 GiB | 18.79 GiB | +0.28 |
+| | decode | 319.2 ms/tok | 326.7 | +2.3% |
+| | prefill | 79.7 tok/s | 76.0 | −4.6% |
+| **gpt-oss-120b** | memory | 14.48 GiB | 14.91 GiB | +0.43 |
+| | decode | 259.9 ms/tok | 262.1 | +0.8% |
+| | prefill | 106.8 tok/s | **92.2** | **−13.7%** |
+
+Three things come out of this, and none of them are about MoEStream.
+
+**Memory rose by 0.3–0.5 GiB everywhere, on both sides.** It rises by the same
+amount with `MOESTREAM=0`, so it is upstream's, not this patch's. It is why every
+percentage saving in this document moved a point or two: the baseline moved too.
+
+**`qwen3next` decode got 33% faster upstream.** Qwen3-Coder-Next went from 101.7
+to 67.8 ms/token with no change here. This is the largest single movement in the
+table and it belongs entirely to llama.cpp.
+
+**Prefill regressed 13–14% on two models.** Ornith's *plain* prefill fell from
+295.6 to 256.2 tok/s while the streamed side barely moved (242.5 → 239.4). That
+makes MoEStream's prefill look better — 93% of plain rather than 82% — and it
+would be dishonest to present it that way. The streamed side did not improve;
+the baseline got worse.
+
+#### Dense, measured the same way
+
+The dense figures elsewhere in this document came from ad-hoc scripts. These come
+from the same `ms-bench.sh` run as the table above — **`ctx 32768`, like the MoE
+rows**, which is why the memory differs from §12.4c below (`ctx 16384`):
+
+| | plain llama.cpp | MoEStream (whole FFN) | |
+|---|---:|---:|---|
+| **Qwen3.8-27B** memory | 16.83 GiB | **8.15 GiB** | −52% |
+| prefill | 69.1 tok/s | 67.0 tok/s | −3% |
+| decode | 214.5 ms/tok | 681.0 ms/tok | 3.17x |
+| **gemma-4-31B** memory | 19.76 GiB | **9.16 GiB** | −54% |
+| prefill | 55.5 tok/s | **56.7 tok/s** | **+2%** |
+| decode | 232.4 ms/tok | 704.6 ms/tok | 3.03x |
+
+gemma-4's prefill is marginally *faster* streamed than resident. The difference
+is within run-to-run spread and should not be read as a gain; what it does
+establish is that prompt processing is free on a plain transformer as well as on
+the hybrids, which had not been shown at these conditions before.
+
+All ten measurements reported zero `[BUG]` lines and correct output.
+
+---
+
+### 12.4c Every model, against the baseline that exists (2026-08-25)
+
+The tables elsewhere quote three of the four large models against **the size of
+the file on disk**, because plain llama.cpp cannot start them and there is no
+other reference. That is honest for those rows and misleading for the small ones,
+where a real baseline does exist and was not used. Measured here with both sides
+started in the same session, ctx 16384, `N_PARALLEL=1`, KV `q8_0`:
+
+| | plain llama.cpp | MoEStream | |
+|---|---:|---:|---|
+| Qwen3.5-4B (dense, FFN streamed) | 3.95 GiB | **2.75 GiB** | −30% |
+| Qwen3.8-27B (dense, FFN streamed) | 16.25 GiB | **7.57 GiB** | **−53%** |
+| gemma-4-31B (dense, FFN streamed) | 19.04 GiB | **8.44 GiB** | **−56%** |
+| Ornith-1.0-35B (MoE, `frac=0.25`) | 17.55 GiB | **7.71 GiB** | **−56%** |
+| Ornith-1.5-35B (MoE, `frac=0.25`) | 20.40 GiB | **7.80 GiB** | **−62%** |
+| Qwen3-Coder-Next (MoE, `frac=0.25`) | does not start | 13.18 GiB | −64% of the file |
+| Laguna-S-2.1 (MoE, `frac=0.25`) | does not start | 21.09 GiB | −61% of the file |
+| gpt-oss-120b (MoE, `frac=0.25`) | does not start | 20.57 GiB | −65% of the file |
+
+**Qwen3.5-4B had been reported as a model streaming does not help.** It does:
+3.95 → 2.75 GiB, a 30% cut. That claim came from comparing 2.75 GiB against the
+2.71 GiB *file* rather than against the 3.95 GiB plain llama.cpp actually uses. A
+model file is not a memory baseline — the runtime adds compute buffers, a KV
+cache and an allocator's slack on top of it, and on a 4B model that overhead is a
+third of the total.
+
+Output was correct on all eight, and every figure reproduced across two starts.
+
+---
+
 ### 12.5 Four-model summary (re-measured 2026-08-06 to 08-08)
 
 **Measurement conditions** — always quote these alongside the table.
@@ -2369,7 +2509,7 @@ sed -i 's/^MOESTREAM=0/MOESTREAM=1/' .env && make up
 | GPU | AMD Radeon 780M (RADV PHOENIX), Vulkan, **UMA** |
 | RAM | 30.6 GiB / **GTT limit 23.5 GiB** ← the fits/does-not-fit boundary |
 | SSD | Crucial P310 (PCIe 4.0 NVMe), 4.48 GB/s effective |
-| llama.cpp | `3581ba0cf` (build 10230) |
+| llama.cpp | `3581ba0cf` (build 10230) — see §12.4b for the same table on `b0539c43` |
 | common settings | `CTX_SIZE=32768` / `UBATCH=1024` / `N_PARALLEL=1` / KV `q8_0` / FlashAttention on / `ngl 99` |
 | prefill | a **13877-token real document** (`research/bench/prompt_long.txt`), `cache_prompt=false` |
 | decode | **median** of 3 × 100 tokens after warm-up. A single run is unreliable (§13.3) |
@@ -2423,6 +2563,12 @@ hundreds; it happened to land within one, so this column is directly comparable.
 ## 13. What is new here
 
 ### 13.1 Redefining the bottleneck
+
+> **[2026-08-23]** This section's framing survives, with one correction that
+> changes what "I/O" refers to. See §14's index and
+> `findings/S19-pagecache-share.md`: on a model whose experts fit in RAM the
+> reads are page-cache copies, not device reads, and the two behave differently
+> enough that a conclusion drawn on one does not transfer to the other.
 
 Existing MoE offloading work (Klotski / ProMoE / MoE-Infinity) starts from
 **"SSD bandwidth is insufficient"**. That is correct at 700B class — about 11 GB
@@ -2503,16 +2649,41 @@ To keep the numbers here trustworthy, our own mistaken measurements are recorded
 
 ## 14. Open items
 
+> **[2026-08-23] Several rows below were settled by a later measurement round.**
+> The findings are the primary sources; this table is the index.
+>
+> | | outcome |
+> |---|---|
+> | `soft` mode τ | **rejected on measurement.** Implemented as a rank predicate and measured: +10.2% perplexity for −3.2% decode (S17 / S24 / S25) |
+> | quantization tiers (Q2_K) | **rejected on thesis.** Every form pays for memory with accuracy, which is the trade this project exists to avoid. A Q2_K run also produced the session's fastest decode from a broken configuration — §10.8 recurring (V3) |
+> | dense models | **overturned.** Dense FFN streaming implemented: −54 to −58% memory with perplexity identical to four decimals, and prompt processing free above ubatch 1024. Generation costs **1.94–2.86x** depending on batching and speculation — measured with the baseline in the same configuration, after three earlier figures were found to have compared against a differently-configured one (S18 / S21 / S27 / S29 / S30 / S33 / S34) |
+> | "the bottleneck is I/O" | **needs qualifying.** 98.7% of Ornith-1.0's decode reads never reach the SSD; "I/O" is a page-cache copy on models that fit and a device read on models that do not (S19) |
+> | the memory saving | **priced.** ~8 of the 9.8 GiB freed is usable by a co-tenant at +3.3%; past that there is a cliff to +63% (S26) |
+> | comparison discipline | **three dense figures were reported against a baseline left in another configuration**, each flattering streaming. Corrected in S34, which measures the baseline in every configuration the streamed side is measured in |
+> | speculative decoding | **sign depends on the machine and the model together, and is now learned rather than assumed.** Two costs decide it, both measured directly: a MoE verification pass gets 3.5x dearer from width 1 to 6 while a dense one is flat, and one drafted token costs ~53% of a MoE forward pass against ~11% of a dense one. Result: 2.29x on a streamed dense model; on MoE it loses, streamed and resident alike (48.6 → 51.1 ms/tok at the best setting, −65% at llama.cpp's defaults). `SPEC_DECODING=learn` tries one draft size per start with "off" among the candidates (S42 supersedes S31 / S32) |
+> | sizing a model from its header | **three architectures were being mis-sized.** Per-layer GQA, sliding windows, and hybrid recurrence each break the obvious KV formula; gemma-4 was offered 4096 tokens where 32768 fits in 19.03 GiB. A MoE model's resident size is a property of the machine, not the file, and cannot be quoted from the header at all (S40) |
+> | speculative decoding, revisited | **now enabled automatically where it pays.** Which kinds a model supports is decided by llama.cpp's own `common_speculative_types_from_gguf()`, called from a 30-line tool that links upstream's `common` — the rule is not copied here. Worth **2.71x** on a streamed dense model with a head; the model-free `ngram-*` kinds do nothing when streamed and cost 16% when not, because speculation only pays at an acceptance rate that covers verification (S42) |
+> | remaining speed work | **none within the thesis.** Byte reduction only pays in large steps (22% removed buys 10% of the I/O cost), and large steps require giving up accuracy (S20 / V3) |
+
 | Item | Status | Prospects |
 |---|---|---|
 | CPU↔GPU synchronization | now ~2.2 ms; was a structural floor at 11.4 | removable by adding slot indirection to ggml |
 | Expert Sweep | disabled by ggml graph aliasing | needs a fix in ggml core |
 | ~~prefill 59.7 tok/s~~ | **solved (S7 / S12 / S14)** | staging arena + `UBATCH=1024` + union reads + async prefetch. 46.0 → **242.5 tok/s (5.3x)**, +0.76 GiB, output bit-identical to plain llama.cpp |
-| quantization tiers (Q2_K for streamed experts) | untested | 192 slots would fit in the same 7.9 GiB. **PPL verification essential** |
-| `soft` mode τ | the default 0.02 is inert (0.1%) | even τ=0.06 loses under 3% of weight mass. Room for redesign |
+| quantization tiers (Q2_K for streamed experts) | **rejected 2026-08-23** | off-thesis in every form; see `V3-idea-analysis.md` |
+| `soft` mode τ | **rejected 2026-08-23** | built and measured: +10.2% PPL for −3.2% decode (`S24-skiprank-verdict.md`) |
 | fused-expert GGUFs (`ffn_gate_up_exps`) | not supported | needs a fourth role in `parse_name` (§10.17) |
 | other architectures (DeepSeek / GLM / Mixtral) | adapter designed, unverified | — |
+| dense models | **supported 2026-08-23** | FFN streaming, −56%, no accuracy cost (`S27-dense-streaming-impl.md`). Attention needs a different design (`S30-dense-attention.md`) |
 | a test suite beyond logic checks | `make test` covers logic only | performance and output correctness need real hardware |
+| does `learn` pick the fastest frac? | **yes, and the curve is monotonic** | re-measured 2026-08-24 with a proper warm-up: 0.15 → 0.60 runs 70.1 → 49.6 ms/tok with no turning point, approaching the 42.6 resident baseline. The earlier claim that it turned over at 0.60 was a warm-up artefact, and so was the worry that a hit-rate proxy is blind to it (`S41-frac-curve.md`) |
+| how noisy is a MoE measurement? | **eight times a dense one, and it decays rather than scatters** | three claimed improvements were reported and withdrawn in one session, all on MoE. Dense samples spread 0.03%, MoE 8.1%, and the first sample is always the slow one — so whatever is measured second looks better (`S43-warm-up.md`) |
+| upstream's own MoE offload | **measured, published with a caveat** | `--cpu-moe` runs 71.8 ms/tok against MoEStream's 63.7 at frac 0.25. Our GTT+VRAM probe shows it freeing no device memory (18.02 GiB against 17.78 plain), but llama.cpp does not print its buffer breakdown at this verbosity, so that half is unconfirmed and is not quoted outside this table (`S44-upstream-cpu-moe.md`) |
+| upstream tracking | **default moved to `b0539c43` 2026-08-23** | built and verified on MoE and dense, all 5 patch blocks still attach. Alternating warm-cache A/B against the `3581ba0c` measurement baseline: decode within 1.2%, output identical, +0.51 GiB — the same +0.51 GiB appears with `MOESTREAM=0`, so it is upstream's |
+| every model, every learn mode | **verified end to end 2026-08-25** | eight models, both passes: memory drops on all of them (4B to 120B, 30–65% against a real baseline), output correct everywhere, and all three learn loops close — including the concurrency key that keeps a draft size learned at one `N_PARALLEL` from being applied at another. Two shipped defects were found only by *using* the feature: the recorder called `curl`, which is not in the image, and wrote state files unreadable from the host (`S47-every-model-verified.md`) |
+| every other llama.cpp knob | **measured, none help** | `--poll`, `--threads-batch`, `--no-op-offload`, `--mlock`, `--cache-reuse`, KV at `q4_0` traded for slots, and upstream's `--cpu-moe` — twelve settings, no movement on either family. The knobs that matter were already the ones with `learn` on them (`S46-parameters-that-do-nothing.md`) |
+| measurement tooling | **two bugs fixed 2026-08-24** | `ms-bench.sh` let `.env` overwrite a model named on the command line, so a whole table could be measured on the wrong model with no visible failure; it now takes `--model` / `--ctx` / `--dense-frac` / `--spec`. And `make bench` did not read `.env.launcher`, so anyone set up by the launcher was benchmarking a different configuration from the one running |
+| launcher memory planning | **corrected 2026-08-23** | the KV estimate now reads per-layer GQA, sliding windows, and `full_attention_interval` (`S40-header-sizing.md`) |
 
 ---
 
